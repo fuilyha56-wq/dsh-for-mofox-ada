@@ -5,17 +5,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import aiofiles
 
@@ -25,6 +28,7 @@ from src.kernel.concurrency.task_info import TaskInfo
 from .client import DshRpcClient, DshTransportError
 
 _PROCESS_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +146,19 @@ class EventStreamState:
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
 
 
+@dataclass(frozen=True, slots=True)
+class DshRuntimeEvent:
+    """表示 Runtime 已缓冲的一条 DSH 下行事件。"""
+
+    stream: str
+    sequence: int
+    received_at: str
+    message: dict[str, Any]
+
+
+DshEventListener = Callable[[DshRuntimeEvent], Awaitable[None]]
+
+
 class DshBridgeRuntime:
     """统一管理所有 DSH 调用通道与生命周期。"""
 
@@ -157,6 +174,7 @@ class DshBridgeRuntime:
         self._task_manager = get_task_manager()
         self._processes: dict[str, ManagedProcess] = {}
         self._event_streams: dict[str, EventStreamState] = {}
+        self._event_listeners: dict[str, DshEventListener] = {}
         self._closed = False
 
     def resolve_timeout(self, requested: float | None) -> float:
@@ -502,6 +520,18 @@ class DshBridgeRuntime:
             "dropped_through": state.dropped_through,
         }
 
+    def add_event_listener(self, listener: DshEventListener) -> str:
+        """注册一个异步事件监听器并返回其唯一标识。"""
+
+        listener_id = uuid4().hex
+        self._event_listeners[listener_id] = listener
+        return listener_id
+
+    def remove_event_listener(self, listener_id: str) -> bool:
+        """按唯一标识注销事件监听器。"""
+
+        return self._event_listeners.pop(listener_id, None) is not None
+
     def resolve_data_path(self, path: str) -> Path:
         """解析一个直接数据访问路径并执行 DSH_HOME 边界检查。"""
 
@@ -734,20 +764,41 @@ class DshBridgeRuntime:
         state: EventStreamState,
         message: dict[str, Any],
     ) -> None:
-        """为事件添加桥游标并写入有界缓冲。"""
+        """为事件添加桥游标、写入有界缓冲并逐个通知监听器。"""
 
+        sequence = state.next_sequence
+        received_at = datetime.now(UTC).isoformat()
         if len(state.messages) == state.messages.maxlen and state.messages:
             state.dropped_through = state.messages[0]["sequence"]
         state.messages.append(
             {
-                "sequence": state.next_sequence,
-                "received_at": datetime.now(UTC).isoformat(),
+                "sequence": sequence,
+                "received_at": received_at,
                 "message": message,
             }
         )
         state.next_sequence += 1
         async with state.condition:
             state.condition.notify_all()
+        event = DshRuntimeEvent(
+            stream=state.name,
+            sequence=sequence,
+            received_at=received_at,
+            message=message,
+        )
+        for listener_id, listener in list(self._event_listeners.items()):
+            try:
+                await listener(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _logger.exception(
+                    "事件监听器 %s 处理 %s#%d 时发生异常: %s",
+                    listener_id,
+                    state.name,
+                    sequence,
+                    exc,
+                )
 
     async def _terminate(self, process: asyncio.subprocess.Process) -> None:
         """先温和终止，超时后强制结束子进程。"""
