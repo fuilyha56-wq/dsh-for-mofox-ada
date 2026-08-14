@@ -267,18 +267,96 @@ def test_build_question_response_rejects_malformed_interaction(
     [
         None,
         make_approval(),
+        make_question(kind="approval"),
         make_question(payload={"type": "approval/requested"}),
         make_question(payload=123),
-        make_question(
-            payload={"type": "question/requested", "questions": "oops"}
-        ),
     ],
 )
 def test_build_question_cancellation_rejects_malformed(interaction: object) -> None:
-    """取消只接受合法 question 交互，其余一律 ValueError。"""
+    """取消只做浅校验：非交互/kind 错/payload 非 dict/type 错一律 ValueError。
+
+    题面（questions）畸形不属于拒绝面——取消是畸形 pending 的逃生路径，见
+    ``test_build_question_cancellation_accepts_malformed_questions``。
+    """
 
     with pytest.raises(ValueError):
         build_question_cancellation(interaction)
+
+
+@pytest.mark.parametrize(
+    "interaction",
+    [
+        # questions 缺失
+        make_question(payload={"type": "question/requested"}),
+        # questions 非数组
+        make_question(payload={"type": "question/requested", "questions": "oops"}),
+        make_question(payload={"type": "question/requested", "questions": 42}),
+        make_question(payload={"type": "question/requested", "questions": None}),
+        # 题项非对象
+        make_question(
+            payload={"type": "question/requested", "questions": ["nope"]}
+        ),
+        # 题缺 id / 空 id / 非字符串 id
+        make_question(
+            payload={
+                "type": "question/requested",
+                "questions": [{"question": "缺 id"}],
+            }
+        ),
+        make_question(
+            payload={"type": "question/requested", "questions": [{"id": ""}]}
+        ),
+        make_question(
+            payload={"type": "question/requested", "questions": [{"id": 123}]}
+        ),
+        # 重复 id
+        make_question(
+            payload={
+                "type": "question/requested",
+                "questions": [{"id": "a"}, {"id": "a"}],
+            }
+        ),
+        # multiSelect 畸形
+        make_question(
+            payload={
+                "type": "question/requested",
+                "questions": [{"id": "a", "multiSelect": "yes"}],
+            }
+        ),
+        # options 畸形：非数组 / 项非对象 / 缺非空 label
+        make_question(
+            payload={
+                "type": "question/requested",
+                "questions": [{"id": "a", "options": "nope"}],
+            }
+        ),
+        make_question(
+            payload={
+                "type": "question/requested",
+                "questions": [{"id": "a", "options": [{"x": 1}]}],
+            }
+        ),
+        make_question(
+            payload={
+                "type": "question/requested",
+                "questions": [{"id": "a", "options": [{"label": ""}]}],
+            }
+        ),
+    ],
+)
+def test_build_question_cancellation_accepts_malformed_questions(
+    interaction: object,
+) -> None:
+    """题面畸形（questions 缺失/非数组/题项畸形）的 pending 仍可取消。
+
+    Task2 ``from_runtime_event`` 只校验 envelope/kind/payload.type 即接纳
+    交互，题面畸形既无法回答也应当能取消；取消输出逐字等于 DSH 字面对象。
+    """
+
+    assert build_question_cancellation(interaction) == {
+        "ok": False,
+        "error": {"code": "cancelled", "message": "MoFox cancelled the DSH question"},
+    }
 
 
 def test_build_question_cancellation_matches_dsh_schema() -> None:
@@ -346,6 +424,17 @@ def test_codecs_are_pure_and_do_not_mutate_interaction() -> None:
     build_question_cancellation(question)
     assert question.payload == question_payload_before
     assert question.state == "pending"
+
+    malformed = make_question(
+        payload={
+            "type": "question/requested",
+            "questions": [{"id": "a", "multiSelect": "yes"}],
+        }
+    )
+    malformed_payload_before = copy.deepcopy(malformed.payload)
+    build_question_cancellation(malformed)
+    assert malformed.payload == malformed_payload_before
+    assert malformed.state == "pending"
 
     approval = make_approval()
     approval_payload_before = copy.deepcopy(approval.payload)

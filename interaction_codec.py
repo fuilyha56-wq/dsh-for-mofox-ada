@@ -210,11 +210,13 @@ def build_question_cancellation(
 ) -> dict[str, Any]:
     """构造取消问题的 DSH 响应，精确返回字面对象。
 
-    只接受合法 question 交互；畸形交互、payload 或 kind 一律 ValueError。
+    取消是 pending 畸形题面的逃生路径：只做 interaction/kind/payload.type
+    浅校验（与 Task2 ``from_runtime_event`` 的接纳口径一致），不深度验证
+    questions 题面；题面深校验仅存在于回答路径
+    :func:`build_question_response`。纯函数，不修改 interaction。
     """
 
-    payload = _require_question_payload(interaction)
-    _validate_questions(payload)
+    _require_question_payload(interaction)
     return {
         "ok": False,
         "error": {"code": CANCELLED_CODE, "message": CANCELLED_MESSAGE},
