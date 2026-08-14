@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import logging
 import os
 import re
 import shutil
@@ -22,13 +21,14 @@ from uuid import uuid4
 
 import aiofiles
 
+from src.app.plugin_system.api.log_api import get_logger
 from src.kernel.concurrency import get_task_manager
 from src.kernel.concurrency.task_info import TaskInfo
 
 from .client import DshRpcClient, DshTransportError
 
 _PROCESS_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-_logger = logging.getLogger(__name__)
+_logger = get_logger("dsh_adapter.runtime", display="DSH Adapter Runtime")
 
 
 @dataclass(frozen=True, slots=True)
@@ -792,12 +792,9 @@ class DshBridgeRuntime:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                _logger.exception(
-                    "事件监听器 %s 处理 %s#%d 时发生异常: %s",
-                    listener_id,
-                    state.name,
-                    sequence,
-                    exc,
+                _logger.error(
+                    f"事件监听器 {listener_id} 处理 {state.name}#{sequence} 时发生异常: {exc}",
+                    exc_info=True,
                 )
 
     async def _terminate(self, process: asyncio.subprocess.Process) -> None:

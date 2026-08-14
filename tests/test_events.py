@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging as stdlib_logging
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,25 @@ from plugins.dsh_adapter.runtime import (
     DshRuntimeEvent,
     DshRuntimeOptions,
 )
+
+HOST_RUNTIME_LOGGER_NAME = "dsh_adapter.runtime"
+
+
+def test_runtime_registers_host_logger() -> None:
+    """Runtime 应通过宿主 log API 注册 logger，保证监听器异常在生产日志可见。
+
+    集成边界说明：MoFox 的 ``get_logger`` 会把 logger 注册进宿主全局注册表
+    （``src.kernel.logger.get_all_loggers()``），而 stdlib ``logging.getLogger``
+    不会。因此本测试通过宿主公共 API 的可观察状态验证集成边界，而非 grep 源码：
+    若 runtime 改回 stdlib logger，该名称将不在宿主注册表中，测试即失败。
+    """
+
+    from src.kernel.logger import get_all_loggers
+
+    loggers = get_all_loggers()
+    assert HOST_RUNTIME_LOGGER_NAME in loggers
+    runtime_logger = loggers[HOST_RUNTIME_LOGGER_NAME]
+    assert not isinstance(runtime_logger, stdlib_logging.Logger)
 
 
 @pytest.mark.asyncio
