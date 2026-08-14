@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any
 
@@ -505,3 +506,159 @@ async def test_failed_load_keeps_current_in_memory_state() -> None:
 
     stored = await registry.get_pending("rpc-1")
     assert stored.rpc_id == "rpc-1"
+
+
+# ===========================================================================
+# Fix Round 1：payload 别名穿透（from_runtime_event/upsert/views/持久化边界）
+# ===========================================================================
+
+NESTED_PAYLOAD: dict[str, Any] = {
+    "type": "question/requested",
+    "sessionId": "session-a",
+    "questions": [{"question": "删除 /tmp/data？", "options": ["是", "否"]}],
+    "meta": {"tags": ["dsh", "ops"], "refs": [1, 2, 3]},
+}
+
+
+def test_from_runtime_event_payload_is_detached_from_event() -> None:
+    """提取后修改原始 event payload 的嵌套内容不得改变 interaction.payload。"""
+
+    payload = copy.deepcopy(NESTED_PAYLOAD)
+    event = DshRuntimeEvent(
+        stream="mux",
+        sequence=1,
+        received_at=RECEIVED_AT,
+        message={
+            "type": "server-request",
+            "rpcId": "question-1",
+            "method": "events.mux",
+            "payload": payload,
+        },
+    )
+    interaction = DshPendingInteraction.from_runtime_event(event)
+    assert interaction is not None
+
+    payload["questions"][0]["question"] = "MUTATED"
+    payload["meta"]["tags"].append("mutated")
+    payload["extra"] = {"x": [1]}
+
+    assert interaction.payload == NESTED_PAYLOAD
+
+
+async def test_upsert_detaches_caller_payload_from_registry() -> None:
+    """upsert 后修改调用方 interaction.payload 不得改变 registry 内状态与后续持久化。"""
+
+    persistence = MemoryPersistence()
+    registry = make_registry(persistence)
+    await registry.load()
+    interaction = make_question(payload=copy.deepcopy(NESTED_PAYLOAD))
+    assert await registry.upsert(interaction) is True
+
+    interaction.payload["questions"][0]["question"] = "MUTATED"
+    interaction.payload["meta"]["tags"].append("mutated")
+    interaction.payload["new_key"] = {"nested": [1]}
+
+    stored = await registry.get_pending("rpc-1")
+    assert stored.payload == NESTED_PAYLOAD
+    # 下一次 mutation 的持久化输出仍是原始 payload，未被调用方污染
+    await registry.mark_responding("rpc-1")
+    assert persistence.data is not None
+    assert persistence.data["items"]["rpc-1"]["payload"] == NESTED_PAYLOAD
+
+
+async def test_pending_views_return_detached_payloads() -> None:
+    """修改 list_pending/get_pending 返回对象的嵌套 payload 不影响后续读取与持久化。"""
+
+    persistence = MemoryPersistence()
+    registry = make_registry(persistence)
+    await registry.load()
+    await registry.upsert(make_question(payload=copy.deepcopy(NESTED_PAYLOAD)))
+
+    got = await registry.get_pending("rpc-1")
+    got.payload["questions"][0]["question"] = "HACKED"
+    got.payload["meta"]["tags"].append("hacked")
+    listed = await registry.list_pending("session-a")
+    assert len(listed) == 1
+    listed[0].payload["questions"][0]["options"].append("HACKED")
+    listed[0].payload["meta"]["refs"].clear()
+
+    again = await registry.get_pending("rpc-1")
+    assert again.payload == NESTED_PAYLOAD
+    assert [item.payload for item in await registry.list_pending()] == [NESTED_PAYLOAD]
+    # 篡改返回对象后再触发 mutation，持久化输出仍是原始 payload
+    await registry.mark_responding("rpc-1")
+    assert persistence.data is not None
+    assert persistence.data["items"]["rpc-1"]["payload"] == NESTED_PAYLOAD
+
+
+class MutatingSaveFunc:
+    """模拟越权的存储层：原地改写注入的 data 后再交给真实存储。"""
+
+    def __init__(self, persistence: MemoryPersistence) -> None:
+        """包装持久化 double，记录改写次数。"""
+
+        self._persistence = persistence
+        self.mutations = 0
+
+    async def save(self, store_name: str, name: str, data: dict[str, Any]) -> None:
+        """原地改写 data 的嵌套 payload（模拟缺陷存储），再正常保存。"""
+
+        self.mutations += 1
+        data["items"]["rpc-1"]["payload"]["type"] = "MUTATED"
+        data["items"]["rpc-1"]["payload"]["questions"].append({"hacked": True})
+        await self._persistence.save(store_name, name, data)
+
+
+async def test_save_func_mutating_data_does_not_pollute_registry() -> None:
+    """save_func 原地变异传入的持久化 data 不得污染 registry 内部 payload。"""
+
+    persistence = MemoryPersistence()
+    mutator = MutatingSaveFunc(persistence)
+    registry = DshInteractionRegistry(load_func=persistence.load, save_func=mutator.save)
+    await registry.load()
+    await registry.upsert(make_question(payload=copy.deepcopy(NESTED_PAYLOAD)))
+
+    # 保存已发生（save_func 变异过两次 data），registry 内部状态必须不受影响
+    assert mutator.mutations == 1
+    stored = await registry.get_pending("rpc-1")
+    assert stored.payload == NESTED_PAYLOAD
+    # 再次 mutation（第二次保存、第二次变异）后仍然干净
+    await registry.mark_responding("rpc-1")
+    await registry.mark_pending("rpc-1")
+    assert mutator.mutations == 3
+    stored = await registry.get_pending("rpc-1")
+    assert stored.payload == NESTED_PAYLOAD
+
+
+async def test_load_detaches_payload_from_source_data() -> None:
+    """load 后修改 load_func 返回的共享源数据不得改变 registry 内 payload。"""
+
+    payload = {"type": "question/requested", "questions": [{"question": "a"}]}
+    shared: dict[str, Any] = {
+        "version": 1,
+        "items": {
+            "rpc-1": {
+                "rpc_id": "rpc-1",
+                "session_id": "session-a",
+                "kind": "question",
+                "payload": payload,
+                "stream": "mux",
+                "first_seen_at": RECEIVED_AT,
+                "last_seen_at": RECEIVED_AT,
+                "state": "pending",
+            }
+        },
+    }
+
+    async def load_shared(store_name: str, name: str) -> dict[str, Any]:
+        """每次都返回同一个共享对象（最坏的 load_func 行为）。"""
+
+        return shared
+
+    persistence = MemoryPersistence()
+    registry = DshInteractionRegistry(load_func=load_shared, save_func=persistence.save)
+    await registry.load()
+
+    payload["questions"][0]["question"] = "MUTATED"
+    stored = await registry.get_pending("rpc-1")
+    assert stored.payload == {"type": "question/requested", "questions": [{"question": "a"}]}

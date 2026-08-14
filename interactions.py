@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -58,6 +59,18 @@ class DshPendingInteraction:
     state: InteractionState = "pending"
     approval_id: str | None = None
 
+    def __post_init__(self) -> None:
+        """构造时深拷贝 payload，建立与外部对象的不可变边界。
+
+        frozen dataclass 只保证字段引用不可变，payload 作为可嵌套的 dict 仍可
+        透过别名被外部修改（如 from_runtime_event 的 event payload、upsert 的
+        调用方 payload、load 的共享源数据）。在唯一构造入口统一 ``deepcopy``，
+        使 registry 内部状态与一切外部对象彻底分离；``replace()`` 同样经过
+        ``__init__`` 触发本拷贝，因此状态转换产物也是独立副本。
+        """
+
+        object.__setattr__(self, "payload", copy.deepcopy(self.payload))
+
     @classmethod
     def from_runtime_event(cls, event: DshRuntimeEvent) -> DshPendingInteraction | None:
         """从运行时事件提取完整 pending 交互；不适用或畸形事件安全返回 None。
@@ -102,13 +115,17 @@ class DshPendingInteraction:
         )
 
     def to_persisted_dict(self) -> dict[str, Any]:
-        """返回可 JSON 序列化的持久化表示。"""
+        """返回可 JSON 序列化的持久化表示。
+
+        payload 以深拷贝输出：注入的 ``save_func`` 拿到的是与内部状态完全
+        分离的数据，即使其原地改写传入 data 也不会污染 registry。
+        """
 
         return {
             "rpc_id": self.rpc_id,
             "session_id": self.session_id,
             "kind": self.kind,
-            "payload": self.payload,
+            "payload": copy.deepcopy(self.payload),
             "stream": self.stream,
             "first_seen_at": self.first_seen_at,
             "last_seen_at": self.last_seen_at,
@@ -221,16 +238,24 @@ class DshInteractionRegistry:
             return True
 
     async def list_pending(self, session_id: str | None = None) -> list[DshPendingInteraction]:
-        """列出 pending 交互；可按 session 过滤，按插入顺序返回。"""
+        """列出 pending 交互；可按 session 过滤，按插入顺序返回。
+
+        返回与内部状态分离的副本（``replace`` 经 ``__post_init__`` 深拷贝
+        payload），调用方修改返回对象的嵌套 payload 不影响 registry。
+        """
 
         async with self._lock:
             items = [item for item in self._items.values() if item.state == "pending"]
             if session_id is not None:
                 items = [item for item in items if item.session_id == session_id]
-            return items
+            return [replace(item) for item in items]
 
     async def get_pending(self, rpc_id: str) -> DshPendingInteraction:
-        """返回指定 rpcId 的 pending 交互；不存在或非 pending 时抛 ``KeyError``。"""
+        """返回指定 rpcId 的 pending 交互；不存在或非 pending 时抛 ``KeyError``。
+
+        返回与内部状态分离的副本（``replace`` 经 ``__post_init__`` 深拷贝
+        payload），调用方修改返回对象的嵌套 payload 不影响 registry。
+        """
 
         async with self._lock:
             item = self._items.get(rpc_id)
@@ -238,7 +263,7 @@ class DshInteractionRegistry:
                 raise KeyError(f"没有 pending 交互: rpc_id={rpc_id!r}")
             if item.state != "pending":
                 raise KeyError(f"rpc_id={rpc_id!r} 不是 pending 状态（当前 state={item.state!r}）")
-            return item
+            return replace(item)
 
     async def mark_responding(self, rpc_id: str) -> None:
         """pending -> responding：开始发送结构化响应。"""
