@@ -19,6 +19,9 @@
   ``session/event`` push 的 rpcId 不稳定，message_id 追加嵌套 ``event.type`` 与
   ``event.seq``。
 - ``turn/end`` 完成原因位于嵌套 ``event.data.reason.kind``。
+- 跨任务安全契约：``RenderedDshEvent.raw_message`` 是唯一允许进入
+  MessageEnvelope 的脱敏副本，Task 5 及以后任何消费方都不得退回 Runtime 原
+  ``event.message``。
 """
 
 from __future__ import annotations
@@ -47,12 +50,12 @@ TURN_END_EVENT_TYPE = "turn/end"
 EXTRA_WHITELIST: frozenset[str] = frozenset(
     {
         "dsh_rpc_id",
-        "session_id",
-        "frame_type",
-        "event_stream",
-        "bridge_sequence",
-        "requires_response",
-        "session_event_type",
+        "dsh_session_id",
+        "dsh_frame_type",
+        "dsh_event_stream",
+        "dsh_bridge_sequence",
+        "dsh_requires_response",
+        "dsh_session_event_type",
     }
 )
 _TOOL_NAME_KEYS: tuple[str, ...] = ("name", "tool", "toolName")
@@ -118,7 +121,14 @@ def _truncate(text: str, max_characters: int) -> str:
 
 @dataclass(frozen=True, slots=True)
 class RenderedDshEvent:
-    """表示一条已渲染、可供 MoFox 入站的 DSH 事件。"""
+    """表示一条已渲染、可供 MoFox 入站的 DSH 事件。
+
+    ``raw_message`` 是唯一允许进入 MessageEnvelope 的脱敏副本：它是完整
+    server-request 信封的递归脱敏深拷贝，保留路由所需标识（type/rpcId/
+    payload.sessionId），已剔除 secret/apiKey/credential 类键与大段 Base64
+    原文。Task 5 及以后任何消费方都必须使用 ``raw_message`` 构建
+    MessageEnvelope，不得退回 Runtime 原 ``event.message``。
+    """
 
     session_id: str
     message_id: str
@@ -127,6 +137,7 @@ class RenderedDshEvent:
     requires_response: bool
     immediate: bool
     extra: dict[str, Any]
+    # 唯一允许进入 MessageEnvelope 的脱敏信封副本（见类 docstring）
     raw_message: dict[str, Any]
 
     def __post_init__(self) -> None:
@@ -286,6 +297,10 @@ def render_dsh_event(
     分类只看 ``payload.type`` 与嵌套 ``event.type``，绝不依赖 ``method``。
     无 sessionId 的 host/workspace-*、remote-event、stream/error 仅缓冲，
     返回 None。
+
+    ``raw_message`` 为信封的递归脱敏深拷贝，是唯一允许进入 MessageEnvelope
+    的脱敏副本；消费方不得退回 Runtime 原 ``event.message``（跨任务安全
+    契约，Task 5 必须遵守）。
     """
 
     message = event.message
@@ -349,12 +364,12 @@ def render_dsh_event(
     raw_message = copy.deepcopy(_sanitize(message))
     extra: dict[str, Any] = {
         "dsh_rpc_id": rpc_id,
-        "session_id": session_id,
-        "frame_type": "server-request",
-        "event_stream": event.stream,
-        "bridge_sequence": event.sequence,
-        "requires_response": requires_response,
-        "session_event_type": session_event_type,
+        "dsh_session_id": session_id,
+        "dsh_frame_type": "server-request",
+        "dsh_event_stream": event.stream,
+        "dsh_bridge_sequence": event.sequence,
+        "dsh_requires_response": requires_response,
+        "dsh_session_event_type": session_event_type,
     }
     return RenderedDshEvent(
         session_id=session_id,
@@ -386,7 +401,7 @@ class _ProgressBucket:
     def record(self, rendered: RenderedDshEvent) -> None:
         """记录一条进度事件：计数、工具名与工具结果成败概况。"""
 
-        event_type = rendered.extra.get("session_event_type")
+        event_type = rendered.extra.get("dsh_session_event_type")
         if not isinstance(event_type, str) or not event_type:
             event_type = "event"
         self.counts[event_type] = self.counts.get(event_type, 0) + 1
@@ -418,11 +433,13 @@ def _tool_result_failed(raw_message: dict[str, Any]) -> bool:
 class DshProgressAggregator:
     """按 session 隔离的短窗口进度聚合器；立即事件直接放行。
 
-    ``add(immediate)`` 立即返回该事件；普通进度事件入桶并返回 ``[]``。
-    ``flush_due(now)`` 用调用方传入的 now 判断窗口（deadline 取自首个进度事件的
-    注入时钟 + ``window_seconds``，后续事件不延长窗口）；``flush_session`` 立即
-    取出指定 session 的摘要。``delivery_mode="critical_only"`` 时普通事件直接
-    丢弃且永不形成摘要，立即事件仍正常返回。
+    ``add(immediate)`` 立即返回该事件；``add(turn/end)`` 若同 session 存在待
+    聚合桶，立即返回 ``[摘要, turn_end]``（摘要在前）并清桶，无桶时返回
+    ``[turn_end]``；普通进度事件入桶并返回 ``[]``。``flush_due(now)`` 用调用方
+    传入的 now 判断窗口（deadline 取自首个进度事件的注入时钟 +
+    ``window_seconds``，后续事件不延长窗口）；``flush_session`` 立即取出指定
+    session 的摘要。``delivery_mode="critical_only"`` 时普通事件直接丢弃且
+    永不形成摘要，立即事件（含 turn/end）仍正常返回。
     """
 
     def __init__(
@@ -450,9 +467,21 @@ class DshProgressAggregator:
         self._buckets: dict[str, _ProgressBucket] = {}
 
     def add(self, rendered: RenderedDshEvent) -> list[RenderedDshEvent]:
-        """加入一条已渲染事件；立即事件原样返回，普通进度入桶后返回 []。"""
+        """加入一条已渲染事件。
+
+        立即事件原样返回；``turn/end`` 若同 session 存在待聚合桶，立即返回
+        ``[摘要, turn_end]``（摘要在前）并清桶，无桶时返回 ``[turn_end]``。
+        普通进度事件入桶后返回 ``[]``。两种 delivery_mode 都不吞立即事件；
+        ``critical_only`` 恒无桶，``turn/end`` 同样原样放行。
+        """
 
         if rendered.immediate:
+            if (
+                rendered.extra.get("dsh_session_event_type") == TURN_END_EVENT_TYPE
+            ):
+                bucket = self._buckets.pop(rendered.session_id, None)
+                if bucket is not None:
+                    return [self._make_summary(bucket), rendered]
             return [rendered]
         if self._delivery_mode == "critical_only":
             return []
@@ -460,7 +489,7 @@ class DshProgressAggregator:
         if bucket is None:
             bucket = _ProgressBucket(
                 session_id=rendered.session_id,
-                stream=str(rendered.extra.get("event_stream", "")),
+                stream=str(rendered.extra.get("dsh_event_stream", "")),
                 deadline=self._clock() + self._window_seconds,
             )
             self._buckets[rendered.session_id] = bucket
@@ -515,10 +544,10 @@ class DshProgressAggregator:
             "toolResults": {"ok": ok_count, "error": failed_count},
         }
         extra: dict[str, Any] = {
-            "session_id": bucket.session_id,
-            "event_stream": bucket.stream,
-            "frame_type": "progress",
-            "requires_response": False,
+            "dsh_session_id": bucket.session_id,
+            "dsh_event_stream": bucket.stream,
+            "dsh_frame_type": "progress",
+            "dsh_requires_response": False,
         }
         return RenderedDshEvent(
             session_id=bucket.session_id,
@@ -530,4 +559,3 @@ class DshProgressAggregator:
             extra=extra,
             raw_message=raw_message,
         )
-

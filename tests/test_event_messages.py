@@ -149,12 +149,21 @@ def test_render_question_and_approval_preserves_decision_context() -> None:
     )
     assert question.extra == {
         "dsh_rpc_id": "q-1",
-        "session_id": "session-1",
-        "frame_type": "server-request",
-        "event_stream": "mux",
-        "bridge_sequence": 1,
-        "requires_response": True,
-        "session_event_type": "question/requested",
+        "dsh_session_id": "session-1",
+        "dsh_frame_type": "server-request",
+        "dsh_event_stream": "mux",
+        "dsh_bridge_sequence": 1,
+        "dsh_requires_response": True,
+        "dsh_session_event_type": "question/requested",
+    }
+    assert set(question.extra) == {
+        "dsh_rpc_id",
+        "dsh_session_id",
+        "dsh_frame_type",
+        "dsh_event_stream",
+        "dsh_bridge_sequence",
+        "dsh_requires_response",
+        "dsh_session_event_type",
     }
     assert question.raw_message == QUESTION_MESSAGE
 
@@ -238,7 +247,16 @@ def test_turn_end_renders_immediately_with_reason_kind() -> None:
     assert rendered.requires_response is False
     assert rendered.message_id == "dsh:mux:push-abc:turn/end:7"
     assert rendered.text == "DSH 回合结束 (rpcId: push-abc)\nsessionId: session-1\nreason: completed"
-    assert rendered.extra["session_event_type"] == "turn/end"
+    assert rendered.extra["dsh_session_event_type"] == "turn/end"
+    assert set(rendered.extra) == {
+        "dsh_rpc_id",
+        "dsh_session_id",
+        "dsh_frame_type",
+        "dsh_event_stream",
+        "dsh_bridge_sequence",
+        "dsh_requires_response",
+        "dsh_session_event_type",
+    }
 
 
 def test_host_agent_error_renders_immediately_with_message() -> None:
@@ -343,7 +361,7 @@ def test_session_event_push_message_id_appends_event_type_and_seq() -> None:
     assert rendered is not None
     assert rendered.immediate is False
     assert rendered.message_id == "dsh:mux:push-9:assistant/chunk:5"
-    assert rendered.extra["session_event_type"] == "assistant/chunk"
+    assert rendered.extra["dsh_session_event_type"] == "assistant/chunk"
     assert rendered.text == "DSH 进度：assistant 输出中"
 
 
@@ -356,6 +374,23 @@ def test_raw_message_does_not_share_reference_with_runtime_event() -> None:
     assert rendered.raw_message is not event.message
     event.message["payload"]["questions"][0]["id"] = "mutated"
     assert rendered.raw_message["payload"]["questions"][0]["id"] == "language"
+
+
+def test_raw_message_is_sanitized_envelope_sole_delivery_channel() -> None:
+    """raw_message 是唯一允许进入 MessageEnvelope 的脱敏副本：保留路由标识、剔除 secret。"""
+
+    message = copy.deepcopy(QUESTION_MESSAGE)
+    message["payload"]["apiKey"] = "sk-live-123"
+    rendered = render_dsh_event(make_event(message), max_characters=12000)
+    assert rendered is not None
+    # 路由所需信封标识在脱敏副本中原样保留
+    assert rendered.raw_message["type"] == "server-request"
+    assert rendered.raw_message["rpcId"] == "q-1"
+    assert rendered.raw_message["payload"]["sessionId"] == "session-1"
+    assert rendered.raw_message["payload"]["apiKey"] == "[REDACTED]"
+    # secret 不得进入 text 或 extra 任何通道
+    for channel in (rendered.text, json.dumps(rendered.extra, ensure_ascii=False)):
+        assert "sk-live-123" not in channel
 
 
 def test_secret_keys_redacted_across_raw_message_text_and_extra() -> None:
@@ -536,10 +571,16 @@ def test_progress_events_aggregate_until_window_expiry_then_single_summary() -> 
         "工具结果：1 成功、1 失败"
     )
     assert summary.extra == {
-        "session_id": "session-1",
-        "event_stream": "mux",
-        "frame_type": "progress",
-        "requires_response": False,
+        "dsh_session_id": "session-1",
+        "dsh_event_stream": "mux",
+        "dsh_frame_type": "progress",
+        "dsh_requires_response": False,
+    }
+    assert set(summary.extra) == {
+        "dsh_session_id",
+        "dsh_event_stream",
+        "dsh_frame_type",
+        "dsh_requires_response",
     }
     assert summary.raw_message == {
         "type": "dsh-progress-summary",
@@ -593,8 +634,8 @@ def test_aggregation_is_isolated_per_session() -> None:
     assert due[0].text == "DSH 进度摘要 (session-b)：共 1 条事件。\nassistant/chunk × 1"
 
 
-def test_turn_end_passes_immediately_and_adapter_flushes_session_before_delivery() -> None:
-    """turn/end 作为立即事件放行；Adapter 随后 flush_session 取出前桶摘要，不重复投递。"""
+def test_turn_end_add_flushes_pending_bucket_summary_first() -> None:
+    """add(turn/end) 若同 session 有桶，必须立即返回 [摘要, turn_end]（摘要在前）并清桶。"""
 
     clock = FakeClock(1000.0)
     aggregator = DshProgressAggregator(window_seconds=2.0, clock=clock)
@@ -603,13 +644,30 @@ def test_turn_end_passes_immediately_and_adapter_flushes_session_before_delivery
     assert aggregator.add(chunk) == []
     turn_end = render_dsh_event(make_event(TURN_END_MESSAGE), max_characters=12000)
     assert turn_end is not None
-    assert aggregator.add(turn_end) == [turn_end]
-    summary = aggregator.flush_session("session-1")
-    assert summary is not None
+    out = aggregator.add(turn_end)
+    assert len(out) == 2
+    summary, delivered = out
+    assert delivered is turn_end
+    assert summary.raw_message["type"] == "dsh-progress-summary"
+    assert summary.session_id == "session-1"
     assert summary.text == "DSH 进度摘要 (session-1)：共 1 条事件。\nassistant/chunk × 1"
+    # 桶已清空：flush_session 与 flush_due 均不再产出，不重复投递
     assert aggregator.flush_session("session-1") is None
     clock.now = 2000.0
     assert aggregator.flush_due(clock.now) == []
+
+
+def test_turn_end_add_without_pending_bucket_returns_turn_end_only() -> None:
+    """add(turn/end) 无同 session 桶时只返回 [turn_end]，绝不吞立即事件。"""
+
+    clock = FakeClock(1000.0)
+    aggregator = DshProgressAggregator(window_seconds=2.0, clock=clock)
+    turn_end = render_dsh_event(make_event(TURN_END_MESSAGE), max_characters=12000)
+    assert turn_end is not None
+    assert aggregator.add(turn_end) == [turn_end]
+    clock.now = 2000.0
+    assert aggregator.flush_due(clock.now) == []
+    assert aggregator.flush_session("session-1") is None
 
 
 def test_critical_only_mode_drops_progress_without_delay() -> None:
@@ -628,6 +686,12 @@ def test_critical_only_mode_drops_progress_without_delay() -> None:
     question = render_dsh_event(make_event(QUESTION_MESSAGE), max_characters=12000)
     assert question is not None
     assert aggregator.add(question) == [question]
+    turn_end = render_dsh_event(make_event(TURN_END_MESSAGE), max_characters=12000)
+    assert turn_end is not None
+    # critical_only 恒无桶：turn/end 原样放行，不被吞
+    assert aggregator.add(turn_end) == [turn_end]
+    clock.now = 3000.0
+    assert aggregator.flush_due(clock.now) == []
 
 
 def test_aggregator_rejects_invalid_delivery_mode_and_window() -> None:
