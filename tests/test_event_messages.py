@@ -195,6 +195,25 @@ def test_replayed_requested_frame_renders_stable_message_id() -> None:
     assert first.message_id == "dsh:mux:q-1"
 
 
+def test_session_subscribed_control_frame_is_not_rendered() -> None:
+    """订阅确认仅用于 Runtime 事件缓冲，不能生成 MoFox 聊天消息。"""
+
+    subscribed = make_event(
+        {
+            "type": "server-request",
+            "rpcId": "subscribed-1",
+            "method": "session/subscribed",
+            "payload": {
+                "type": "session/subscribed",
+                "sessionId": "session-1",
+                "lastSeq": 42,
+            },
+        }
+    )
+
+    assert render_dsh_event(subscribed, max_characters=12000) is None
+
+
 def test_resolved_events_render_immediately_without_response_requirement() -> None:
     """question/resolved 与 approval/resolved 立即投递，且不要求结构化响应。"""
 

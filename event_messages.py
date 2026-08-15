@@ -298,6 +298,10 @@ def render_dsh_event(
     无 sessionId 的 host/workspace-*、remote-event、stream/error 仅缓冲，
     返回 None。
 
+    仅投递 ``session/event``、明确的交互/代理错误事件和回合结束；例如
+    ``session/subscribed`` 这样的订阅控制帧仅保留在 Runtime 缓冲中，绝不能
+    作为聊天消息或进度摘要投递。
+
     ``raw_message`` 为信封的递归脱敏深拷贝，是唯一允许进入 MessageEnvelope
     的脱敏副本；消费方不得退回 Runtime 原 ``event.message``（跨任务安全
     契约，Task 5 必须遵守）。
@@ -319,6 +323,8 @@ def render_dsh_event(
         return None
     session_id = payload.get("sessionId")
     if not isinstance(session_id, str) or not session_id:
+        return None
+    if payload_type != "session/event" and payload_type not in IMMEDIATE_PAYLOAD_TYPES:
         return None
 
     nested_event: dict[str, Any] | None = None

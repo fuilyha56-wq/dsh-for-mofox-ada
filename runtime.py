@@ -432,7 +432,7 @@ class DshBridgeRuntime:
         raise TimeoutError(f"等待 DSH Web 就绪超时: {last_error}")
 
     async def start_event_stream(self, name: str) -> dict[str, Any]:
-        """启动 ``mux`` 或 ``host`` SSE 事件订阅。"""
+        """启动 ``mux`` 或 ``host`` WebSocket 事件订阅。"""
 
         if name not in {"mux", "host"}:
             raise ValueError("事件流名称必须是 mux 或 host")
@@ -446,6 +446,7 @@ class DshBridgeRuntime:
         if state.task is not None and not state.task.is_done():
             return self.event_stream_status(name)
         state.stopping = False
+        _logger.info(f"正在启动 DSH {name} WebSocket 事件流")
         state.task = self._task_manager.create_task(
             self._event_stream_loop(state),
             name=f"dsh-adapter-events-{name}",
@@ -454,12 +455,13 @@ class DshBridgeRuntime:
         return self.event_stream_status(name)
 
     async def stop_event_stream(self, name: str) -> dict[str, Any]:
-        """停止一条 DSH SSE 事件订阅。"""
+        """停止一条 DSH WebSocket 事件订阅。"""
 
         state = self._event_streams.get(name)
         if state is None:
             return {"name": name, "running": False, "message_count": 0}
         state.stopping = True
+        _logger.info(f"正在停止 DSH {name} WebSocket 事件流")
         if state.task is not None:
             state.task.cancel()
             if state.task.task is not None:
@@ -525,12 +527,16 @@ class DshBridgeRuntime:
 
         listener_id = uuid4().hex
         self._event_listeners[listener_id] = listener
+        _logger.debug(f"已注册 DSH 事件监听器: {listener_id}")
         return listener_id
 
     def remove_event_listener(self, listener_id: str) -> bool:
         """按唯一标识注销事件监听器。"""
 
-        return self._event_listeners.pop(listener_id, None) is not None
+        removed = self._event_listeners.pop(listener_id, None) is not None
+        if removed:
+            _logger.debug(f"已移除 DSH 事件监听器: {listener_id}")
+        return removed
 
     def resolve_data_path(self, path: str) -> Path:
         """解析一个直接数据访问路径并执行 DSH_HOME 边界检查。"""
@@ -729,12 +735,13 @@ class DshBridgeRuntime:
             record.condition.notify_all()
 
     async def _event_stream_loop(self, state: EventStreamState) -> None:
-        """连接并自动重连 DSH 下行 SSE。"""
+        """连接并自动重连 DSH 下行 WebSocket 事件流。"""
 
         path = f"/api/events.{state.name}"
         while not state.stopping:
             try:
-                async for raw in self.client.stream_sse(path):
+                _logger.info(f"DSH {state.name} WebSocket 事件流已连接")
+                async for raw in self.client.stream_events(path):
                     if state.stopping:
                         return
                     try:
@@ -749,10 +756,16 @@ class DshBridgeRuntime:
                         }
                     await self._append_event(state, message)
                 if not state.stopping:
+                    _logger.warning(
+                        f"DSH {state.name} WebSocket 事件流已关闭，将在 1 秒后重连"
+                    )
                     await asyncio.sleep(1.0)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                _logger.warning(
+                    f"DSH {state.name} WebSocket 事件流连接失败，将在 1 秒后重连: {exc}"
+                )
                 await self._append_event(
                     state,
                     {"type": "bridge/connection-error", "error": str(exc)},
@@ -785,6 +798,15 @@ class DshBridgeRuntime:
             sequence=sequence,
             received_at=received_at,
             message=message,
+        )
+        payload = message.get("payload")
+        payload_type = payload.get("type") if isinstance(payload, dict) else None
+        session_id = payload.get("sessionId") if isinstance(payload, dict) else None
+        _logger.debug(
+            f"收到 DSH {state.name} 事件 #{sequence}: "
+            f"type={message.get('type')!r}, method={message.get('method')!r}, "
+            f"payload_type={payload_type!r}, session_id={session_id!r}, "
+            f"listeners={len(self._event_listeners)}"
         )
         for listener_id, listener in list(self._event_listeners.items()):
             try:

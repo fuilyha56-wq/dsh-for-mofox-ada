@@ -327,8 +327,9 @@ class DshTransportAdapter(BaseAdapter):
         self._flush_task_info: Any | None = None
 
     async def on_adapter_loaded(self) -> None:
-        """注册 Runtime 监听器后按 mux、host 顺序启动两条 SSE 流。"""
+        """注册 Runtime 监听器后按 mux、host 顺序启动两条 WebSocket 流。"""
 
+        _logger.info("DSH Transport Adapter 正在启动")
         listener_added = False
         started_streams: list[str] = []
         if self._listener_id is None:
@@ -351,6 +352,10 @@ class DshTransportAdapter(BaseAdapter):
                     name="dsh-adapter-progress-flush",
                     daemon=True,
                 )
+            _logger.info(
+                "DSH Transport Adapter 已启动: "
+                f"listener={self._listener_id}, streams={_EVENT_STREAMS}"
+            )
         except BaseException:
             for stream_name in reversed(started_streams):
                 await self.runtime.stop_event_stream(stream_name)
@@ -362,6 +367,7 @@ class DshTransportAdapter(BaseAdapter):
     async def on_adapter_unloaded(self) -> None:
         """停止事件流并移除监听器，但不关闭共享 Runtime 或 HTTP 客户端。"""
 
+        _logger.info("DSH Transport Adapter 正在停止")
         await self._cancel_flush_task()
         try:
             await self.runtime.stop_event_stream("mux")
@@ -376,6 +382,7 @@ class DshTransportAdapter(BaseAdapter):
                     if self._listener_id is not None:
                         self.runtime.remove_event_listener(self._listener_id)
                         self._listener_id = None
+        _logger.info("DSH Transport Adapter 已停止")
 
     async def health_check(self) -> bool:
         """确认 host.describe 成功且 mux、host 两条流均处于运行状态。"""
@@ -422,6 +429,10 @@ class DshTransportAdapter(BaseAdapter):
             for rendered in rendered_events:
                 self._progress_session_ids.discard(rendered.session_id)
         for rendered in rendered_events:
+            _logger.debug(
+                "投递 DSH 进度摘要: "
+                f"session_id={rendered.session_id!r}, message_id={rendered.message_id!r}"
+            )
             await self.on_platform_message(rendered)
         return len(rendered_events)
 
@@ -465,10 +476,16 @@ class DshTransportAdapter(BaseAdapter):
 
         payload = event.message.get("payload")
         payload_type = payload.get("type") if isinstance(payload, dict) else None
+        session_id = payload.get("sessionId") if isinstance(payload, dict) else None
+        _logger.debug(
+            "处理 DSH Runtime 事件: "
+            f"stream={event.stream}, sequence={event.sequence}, "
+            f"payload_type={payload_type!r}, session_id={session_id!r}"
+        )
         if payload_type == "host/session-removed":
-            session_id = payload.get("sessionId") if isinstance(payload, dict) else None
             if isinstance(session_id, str) and session_id:
                 await self.interaction_registry.mark_session_stale(session_id)
+                _logger.info(f"DSH session 已移除，已清理 pending 交互: {session_id!r}")
             return
         if payload_type == "question/resolved":
             question_rpc_id = (
@@ -483,7 +500,18 @@ class DshTransportAdapter(BaseAdapter):
 
         rendered = render_dsh_event(event, self._max_event_characters)
         if rendered is None:
+            _logger.debug(
+                "DSH Runtime 事件不满足入站渲染条件，已仅保留在运行时缓冲: "
+                f"stream={event.stream}, sequence={event.sequence}, "
+                f"payload_type={payload_type!r}"
+            )
             return
+        _logger.debug(
+            "DSH 事件已渲染: "
+            f"session_id={rendered.session_id!r}, message_id={rendered.message_id!r}, "
+            f"event_type={rendered.extra.get('dsh_session_event_type')!r}, "
+            f"immediate={rendered.immediate}, requires_response={rendered.requires_response}"
+        )
         event_type = rendered.extra.get("dsh_session_event_type")
         if event_type == "turn/end":
             self._progress_session_ids.discard(rendered.session_id)
@@ -492,12 +520,25 @@ class DshTransportAdapter(BaseAdapter):
         if rendered.requires_response:
             interaction = DshPendingInteraction.from_runtime_event(event)
             if interaction is None:
+                _logger.warning(
+                    "DSH 交互事件缺少可登记字段，未投递: "
+                    f"session_id={rendered.session_id!r}, message_id={rendered.message_id!r}"
+                )
                 return
             if not await self.interaction_registry.upsert(interaction):
+                _logger.debug(
+                    "DSH 重复交互事件已忽略: "
+                    f"rpc_id={interaction.rpc_id!r}, session_id={interaction.session_id!r}"
+                )
                 return
             if interaction.kind == "approval" and self.interaction_responder is not None:
                 await self.interaction_responder.auto_reject_approval(interaction.rpc_id)
         for outbound in self._aggregator.add(rendered):
+            _logger.info(
+                "投递 DSH 入站事件到 CoreSink: "
+                f"session_id={outbound.session_id!r}, message_id={outbound.message_id!r}, "
+                f"event_type={outbound.extra.get('dsh_session_event_type')!r}"
+            )
             await self.on_platform_message(outbound)
 
     async def _flush_loop(self) -> None:

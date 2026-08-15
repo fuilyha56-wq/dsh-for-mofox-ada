@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 import httpx
+import websockets
 
 
 class DshTransportError(RuntimeError):
@@ -199,52 +200,34 @@ class DshRpcClient:
             body=b"".join(chunks),
         )
 
-    async def stream_sse(self, path: str) -> AsyncIterator[str]:
-        """逐帧读取一个 DSH 同源 SSE 事件流。"""
+    async def stream_events(self, path: str) -> AsyncIterator[str]:
+        """逐帧读取一个 DSH 同源 WebSocket 事件流。"""
 
         parsed = urlsplit(path)
         if parsed.scheme or parsed.netloc or not parsed.path.startswith("/"):
             raise ValueError("path 必须是以 / 开头的同源相对路径")
-        stream_timeout = httpx.Timeout(
-            connect=self.timeout,
-            read=None,
-            write=self.timeout,
-            pool=self.timeout,
-        )
+        ws_scheme = "wss" if self.base_url.startswith("https://") else "ws"
+        event_url = f"{ws_scheme}://{urlsplit(self.base_url).netloc}{path}"
         try:
-            async with self._async_client.stream(
-                method="GET",
-                url=path,
-                headers={"accept": "text/event-stream"},
-                timeout=stream_timeout,
-            ) as response:
-                if not response.is_success:
-                    raise DshTransportError(
-                        f"DSH SSE 请求失败: HTTP {response.status_code}"
-                    )
-                data_lines: list[str] = []
-                event_bytes = 0
-                async for line in response.aiter_lines():
-                    if line == "":
-                        if data_lines:
-                            yield "".join(data_lines)
-                            data_lines = []
-                            event_bytes = 0
-                        continue
-                    if line.startswith("data: "):
-                        data = line[6:]
-                    elif line == "data:":
-                        data = ""
-                    else:
-                        continue
-                    event_bytes += len(data.encode("utf-8"))
-                    if event_bytes > self.max_response_bytes:
-                        raise DshTransportError("DSH SSE 事件超过大小限制")
-                    data_lines.append(data)
+            async with websockets.connect(
+                event_url,
+                open_timeout=self.timeout,
+                close_timeout=self.timeout,
+                max_size=self.max_response_bytes,
+            ) as socket:
+                async for raw in socket:
+                    if isinstance(raw, bytes):
+                        try:
+                            raw = raw.decode("utf-8")
+                        except UnicodeDecodeError as exc:
+                            raise DshTransportError(
+                                "DSH WebSocket 事件不是有效 UTF-8 文本"
+                            ) from exc
+                    yield raw
         except DshTransportError:
             raise
-        except httpx.HTTPError as exc:
-            raise DshTransportError(f"无法连接 DSH SSE: {exc}") from exc
+        except websockets.WebSocketException as exc:
+            raise DshTransportError(f"无法连接 DSH WebSocket 事件流: {exc}") from exc
 
     async def close(self) -> None:
         """关闭异步 HTTP 连接池。"""

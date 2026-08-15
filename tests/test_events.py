@@ -8,6 +8,7 @@ import logging as stdlib_logging
 from pathlib import Path
 
 import pytest
+import websockets
 
 from plugins.dsh_adapter.runtime import (
     DshBridgeRuntime,
@@ -37,7 +38,7 @@ def test_runtime_registers_host_logger() -> None:
 
 @pytest.mark.asyncio
 async def test_event_stream_preserves_complete_server_request(tmp_path: Path) -> None:
-    """事件订阅应完整保留 DSH ServerRequest 信封并提供桥游标。"""
+    """WebSocket 事件订阅应完整保留 DSH ServerRequest 信封并提供桥游标。"""
 
     expected = (
         '{"type":"server-request","rpcId":"question-1",'
@@ -46,26 +47,11 @@ async def test_event_stream_preserves_complete_server_request(tmp_path: Path) ->
 
     requested_paths: list[str] = []
 
-    async def handler(
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-    ) -> None:
-        request_line = (await reader.readline()).decode("ascii")
-        requested_paths.append(request_line.split()[1])
-        while await reader.readline() not in {b"\r\n", b"\n", b""}:
-            pass
-        writer.write(
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: text/event-stream\r\n"
-            b"Cache-Control: no-cache\r\n"
-            b"Connection: close\r\n\r\n"
-            + f"data: {expected}\n\n".encode()
-        )
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+    async def handler(connection: websockets.ServerConnection) -> None:
+        requested_paths.append(connection.request.path)
+        await connection.send(expected)
 
-    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    server = await websockets.serve(handler, "127.0.0.1", 0)
     try:
         port = server.sockets[0].getsockname()[1]
         runtime = DshBridgeRuntime(
@@ -112,30 +98,15 @@ async def test_event_listener_receives_complete_runtime_event(
     }
     raw = json.dumps(payload)
 
-    async def handler(
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-    ) -> None:
-        await reader.readline()
-        while await reader.readline() not in {b"\r\n", b"\n", b""}:
-            pass
-        writer.write(
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: text/event-stream\r\n"
-            b"Cache-Control: no-cache\r\n"
-            b"Connection: close\r\n\r\n"
-            + f"data: {raw}\n\n".encode()
-        )
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+    async def handler(connection: websockets.ServerConnection) -> None:
+        await connection.send(raw)
 
     received: asyncio.Queue[DshRuntimeEvent] = asyncio.Queue()
 
     async def record_listener(event: DshRuntimeEvent) -> None:
         await received.put(event)
 
-    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    server = await websockets.serve(handler, "127.0.0.1", 0)
     try:
         port = server.sockets[0].getsockname()[1]
         runtime = DshBridgeRuntime(
@@ -195,26 +166,10 @@ async def test_event_listeners_are_isolated_and_removable(tmp_path: Path) -> Non
     }
     release_second = asyncio.Event()
 
-    async def handler(
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-    ) -> None:
-        await reader.readline()
-        while await reader.readline() not in {b"\r\n", b"\n", b""}:
-            pass
-        writer.write(
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: text/event-stream\r\n"
-            b"Cache-Control: no-cache\r\n"
-            b"Connection: close\r\n\r\n"
-            + f"data: {json.dumps(payload_1)}\n\n".encode()
-        )
-        await writer.drain()
+    async def handler(connection: websockets.ServerConnection) -> None:
+        await connection.send(json.dumps(payload_1))
         await release_second.wait()
-        writer.write(f"data: {json.dumps(payload_2)}\n\n".encode())
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+        await connection.send(json.dumps(payload_2))
 
     received: asyncio.Queue[DshRuntimeEvent] = asyncio.Queue()
 
@@ -224,7 +179,7 @@ async def test_event_listeners_are_isolated_and_removable(tmp_path: Path) -> Non
     async def record_listener(event: DshRuntimeEvent) -> None:
         await received.put(event)
 
-    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    server = await websockets.serve(handler, "127.0.0.1", 0)
     try:
         port = server.sockets[0].getsockname()[1]
         runtime = DshBridgeRuntime(
