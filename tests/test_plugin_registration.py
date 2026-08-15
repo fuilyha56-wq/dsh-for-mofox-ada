@@ -63,11 +63,27 @@ def test_manifest_registers_adapter_and_response_action() -> None:
         for entry in manifest["include"]
     }
 
-    assert manifest["version"] == "1.4.0"
+    assert manifest["version"] == "1.0.0"
     assert len(manifest["include"]) == 12
     assert ("adapter", "dsh_adapter") in includes
     assert ("action", "dsh_respond") in includes
     assert all("websockets" not in item for item in manifest["python_dependencies"])
+
+
+def test_dsh_bundle_metadata_registers_the_package_patch() -> None:
+    """DSH Marketplace 所需的 bundle 清单必须指向可装配的同名 package。"""
+
+    root = Path(__file__).resolve().parents[1]
+    package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+    patch = (root / "cordis.patch.yml").read_text(encoding="utf-8")
+
+    assert package["name"] == "dsh-for-mofox-ada"
+    assert package["version"] == "1.0.0"
+    assert package["type"] == "module"
+    assert package["main"] == "index.js"
+    assert package["dsh"]["bundle"] == {"patch": "./cordis.patch.yml"}
+    assert {"index.js", "cordis.patch.yml"}.issubset(package["files"])
+    assert "name: dsh-for-mofox-ada" in patch
 
 
 @pytest.mark.asyncio

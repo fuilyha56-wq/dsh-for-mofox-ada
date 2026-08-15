@@ -1,7 +1,7 @@
 {
   "name": "dsh_adapter",
   "display_name": "DSH Adapter",
-  "version": "1.4.0",
+  "version": "1.0.0",
   "description": "让 Neo-MoFox 完整调用和管理 DeepSeek Harness",
   "author": "MoFox User",
   "dependencies": {

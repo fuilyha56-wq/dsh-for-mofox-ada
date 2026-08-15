@@ -36,7 +36,7 @@ class DshAdapterService(BaseService):
 
     name = "dsh_adapter"
     description = "调用 DSH 模型、RPC、HTTP、CLI、进程、事件流和数据能力"
-    version = "1.4.0"
+    version = "1.0.0"
 
     @property
     def dispatcher(self) -> DshOperationDispatcher:

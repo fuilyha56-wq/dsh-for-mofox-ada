@@ -54,7 +54,7 @@ class DshAdapterPlugin(BasePlugin):
 
     plugin_name = "dsh_adapter"
     plugin_description = "DeepSeek Harness 全能力适配器"
-    plugin_version = "1.4.0"
+    plugin_version = "1.0.0"
     configs = [DshBridgeConfig]
 
     def __init__(self, config: DshBridgeConfig | None = None) -> None:

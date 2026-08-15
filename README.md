@@ -1,8 +1,41 @@
 # DSH Adapter
 
+[![dshfind](https://dshfind.com/api/badge/fuilyha56-wq/dsh-for-mofox-ada?lang=zh)](https://dshfind.com/zh/plugins/fuilyha56-wq/dsh-for-mofox-ada?ref=badge)
+
 `dsh_adapter` 让 Neo-MoFox 调用和管理本机 DeepSeek Harness。插件不会复刻 DSH
 内部能力，而是完整保留 DSH 官方边界：任意一元 RPC、同源 HTTP、CLI 参数、
 profile、长期进程、HTTP SSE 下行事件和 `DSH_HOME` 数据。
+
+当前发布版本：`1.0.0`。
+
+## 安装
+
+仓库根目录提供 DSH bundle，可先将其登记到 DSH Web profile：
+
+```sh
+dsh plugin --profile web add github:fuilyha56-wq/dsh-for-mofox-ada
+```
+
+本地开发或已克隆仓库时：
+
+```sh
+dsh plugin --profile web add .
+```
+
+该 bundle 的作用是让 DSH profile 记录此集成包；它不在 DSH 的 Node/Cordis 进程中
+执行 Neo-MoFox 的 Python 代码。完整桥接运行时仍必须作为 Neo-MoFox 插件部署：将本目录
+放入 Neo-MoFox 的 `plugins/`，重启或重新加载 Neo-MoFox，然后确认
+`dsh_adapter:adapter:dsh_adapter` 已注册。DSH Web 与 Neo-MoFox 可以运行在同一台主机，
+默认通过 `http://127.0.0.1:18948` 通信。
+
+未发布到 npm 前，建议固定可信提交安装，例如：
+
+```sh
+dsh plugin --profile web add github:fuilyha56-wq/dsh-for-mofox-ada#COMMIT_SHA
+```
+
+DSH 使用 pnpm 安装 git 依赖；若它提示需要在 profile 的 `pnpm-workspace.yaml` 中授权
+`allowBuilds`，仅在审阅并信任该固定提交后再授予权限。本包没有构建步骤或安装脚本。
 
 ## 组件
 

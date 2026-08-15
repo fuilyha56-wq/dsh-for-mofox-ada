@@ -246,7 +246,7 @@ class DshTransportAdapter(BaseAdapter):
 
     name = "dsh_adapter"
     adapter_name = name
-    adapter_version = "1.4.0"
+    adapter_version = "1.0.0"
     description = "DeepSeek Harness 原生传输适配器"
     platform = "dsh"
 

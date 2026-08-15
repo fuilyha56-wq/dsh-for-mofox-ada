@@ -1,0 +1,32 @@
+{
+  "name": "dsh-for-mofox-ada",
+  "version": "1.0.0",
+  "description": "DSH bundle and deployment metadata for the Neo-MoFox DSH Adapter bridge",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "API.md",
+    "manifest.json",
+    "*.py",
+    "examples"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "neo-mofox",
+    "adapter"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "UNLICENSED",
+  "private": false
+}
