@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
@@ -67,3 +68,34 @@ def test_manifest_registers_adapter_and_response_action() -> None:
     assert ("adapter", "dsh_adapter") in includes
     assert ("action", "dsh_respond") in includes
     assert all("websockets" not in item for item in manifest["python_dependencies"])
+
+
+@pytest.mark.asyncio
+async def test_plugin_unload_stops_native_adapter_before_runtime_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PluginManager 卸载时必须先停 Adapter，避免关闭共享 Runtime 后遗留监听器。"""
+
+    plugin = DshAdapterPlugin(DshBridgeConfig())
+    calls: list[str] = []
+
+    async def _stop_adapter(signature: str) -> bool:
+        """记录 Adapter 停止调用。"""
+
+        calls.append(f"stop:{signature}")
+        return True
+
+    async def _close_runtime() -> None:
+        """记录 Runtime 关闭调用。"""
+
+        calls.append("runtime:close")
+
+    monkeypatch.setattr("plugins.dsh_adapter.plugin.stop_adapter", _stop_adapter)
+    plugin.runtime.close = AsyncMock(side_effect=_close_runtime)
+
+    await plugin.on_plugin_unloaded()
+
+    assert calls == [
+        "stop:dsh_adapter:adapter:dsh_adapter",
+        "runtime:close",
+    ]

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, cast
 
+from src.app.plugin_system.api.adapter_api import stop_adapter
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BasePlugin, register_plugin
 
@@ -154,6 +155,11 @@ class DshAdapterPlugin(BasePlugin):
     async def on_plugin_unloaded(self) -> None:
         """关闭事件流、HTTP 客户端和桥启动的 DSH 子进程。"""
 
+        config = cast(DshBridgeConfig, self.config)
+        if config.interaction.enabled and config.bridge.start_event_streams:
+            signature = f"{self.plugin_name}:adapter:{DshTransportAdapter.name}"
+            if not await stop_adapter(signature):
+                logger.warning(f"DSH Adapter 停止失败或未启动: {signature}")
         await self.runtime.close()
         logger.info("DSH Adapter 运行时已关闭")
 
