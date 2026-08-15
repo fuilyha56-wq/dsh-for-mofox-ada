@@ -30,7 +30,7 @@ HTTP 使用 `POST /api/dsh-adapter/execute`，LLM Action 使用 `operation` 和
 | `process_output` | `process_id`, `after_sequence?`, `limit?`, `wait_seconds?` | 增量读取 stdout/stderr |
 | `process_list` | 无 | 列出长期进程 |
 | `process_stop` | `process_id` | 停止长期进程 |
-| `event_start` | `stream` | 启动 `mux` 或 `host` WebSocket 下行流 |
+| `event_start` | `stream` | 启动 `mux` 或 `host` HTTP SSE 下行流 |
 | `event_stop` | `stream` | 停止事件流 |
 | `event_status` | `stream` | 查询事件流状态 |
 | `event_read` | `stream`, `after_sequence?`, `limit?`, `wait_seconds?` | 增量读取完整 ServerRequest 信封 |
@@ -158,8 +158,10 @@ HTTP 使用 `POST /api/dsh-adapter/execute`，LLM Action 使用 `operation` 和
 
 ## 事件与交互
 
-Web profile 提供两条只下行 WebSocket：`events.mux` 与 `events.host`。桥为每条消息
-添加独立递增 `sequence`，但 `message` 内仍是 DSH 原始完整信封。
+Web profile 提供两条只下行 HTTP SSE：`GET /api/events.mux` 与
+`GET /api/events.host`。桥为每条消息添加独立递增 `sequence`，但 `message` 内仍是
+DSH 原始完整信封。启用原生 Adapter 后，每个 `sessionId` 映射为一条
+`platform=dsh` 的 Neo-MoFox 私聊流。
 
 收到需要回答的 ServerRequest 后，取其 `rpcId`，再调用：
 
@@ -178,6 +180,48 @@ Web profile 提供两条只下行 WebSocket：`events.mux` 与 `events.host`。�
 
 具体 `value` 结构由该 ServerRequest 的方法定义；错误结构同样可通过 `result`
 原样发送。
+
+对于 Web session 的 `question/requested` 与 `approval/requested`，LLM 不应调用通用
+`respond` operation。应使用受同流校验的 `dsh_respond` Action，或者 Owner `/dsh respond`
+命令与以下 Service API。普通 `session.prompt` 在该 session 存在 pending 交互时会被拒绝。
+
+### `dsh_respond` Action
+
+Action 必须在收到对应 DSH 入站事件的同一私聊流中调用：
+
+```json
+{
+  "rpc_id": "QUESTION_RPC_ID",
+  "response_type": "answer",
+  "response_json": "[{\"id\":\"language\",\"selected\":[\"Python\"]}]"
+}
+```
+
+`response_type` 仅支持：
+
+| 值 | `response_json` | 作用 |
+| --- | --- | --- |
+| `answer` | JSON 对象数组 | 回答 question；每项含 `id`、`selected[]` 和可选 `custom` |
+| `cancel` | 可省略 | 取消 pending question |
+| `approve` | 可省略 | 请求单次允许，受 `approval_policy` 限制 |
+| `reject` | 可省略 | 拒绝 pending approval |
+
+Action 固定以 Bot 身份调用，不能通过参数模拟 Owner。`ask` 策略下只有 Owner 命令能发送
+`allowed-once`；`autonomous` 允许 Bot 与 Service 单次批准；`reject` 会由 Adapter 自动拒绝
+首次审批请求。只有 `/api/respond` 返回 `{"accepted": true}` 才消费 pending。其它拒绝会保留
+为可重试；`reason="not-pending"` 会将该记录标记为 stale。
+
+### Service 交互接口
+
+```python
+async def list_pending(session_id: str | None = None) -> list[dict[str, Any]]: ...
+async def answer_question(rpc_id: str, answers: list[dict[str, Any]]) -> dict[str, Any]: ...
+async def cancel_question(rpc_id: str) -> dict[str, Any]: ...
+async def respond_approval(rpc_id: str, outcome: str) -> dict[str, Any]: ...
+```
+
+`list_pending()` 返回 `rpc_id`、`session_id`、`kind`、`state`、`approval_id`，不返回题面或
+凭据。Service 的 actor 始终为 `service`，调用者不能伪造 Owner；因此 `ask` 策略下只能拒绝。
 
 ## HTTP 下载与非 RPC 接口
 

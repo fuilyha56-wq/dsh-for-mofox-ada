@@ -2,7 +2,7 @@
 
 `dsh_adapter` 让 Neo-MoFox 调用和管理本机 DeepSeek Harness。插件不会复刻 DSH
 内部能力，而是完整保留 DSH 官方边界：任意一元 RPC、同源 HTTP、CLI 参数、
-profile、长期进程、WebSocket 下行事件和 `DSH_HOME` 数据。
+profile、长期进程、HTTP SSE 下行事件和 `DSH_HOME` 数据。
 
 ## 组件
 
@@ -10,12 +10,14 @@ profile、长期进程、WebSocket 下行事件和 `DSH_HOME` 数据。
 | --- | --- |
 | `dsh_adapter:service:dsh_adapter` | 供其他插件调用全部桥接操作 |
 | `dsh_adapter:command:dsh` | Owner 级 `/dsh` 管理命令 |
+| `dsh_adapter:adapter:dsh_adapter` | 将每个 DSH Web session 映射为 Neo-MoFox 私聊流 |
 | `dsh_adapter:router:dsh_adapter` | `/api/dsh-adapter` HTTP API |
 | `dsh_adapter:tool:dsh_query` | LLM 只读查询 Tool |
 | `dsh_adapter:action:dsh_headless` | LLM 委派任务给 DSH headless Agent |
 | `dsh_adapter:action:dsh_model_switch` | LLM 按实时目录切换 DSH 会话模型 |
 | `dsh_adapter:action:dsh_preset_switch` | LLM 切换空白 DSH 会话的 Agent preset 模式 |
 | `dsh_adapter:action:dsh_operate` | LLM 完整 DSH 操作 Action |
+| `dsh_adapter:action:dsh_respond` | LLM 在当前 DSH 私聊流中结构化回答问题或审批 |
 
 ## 启动
 
@@ -48,10 +50,24 @@ allow_remote_without_token = false
 [llm]
 expose_tools = true
 expose_actions = true
+
+[interaction]
+enabled = true
+approval_policy = "ask"
+progress_delivery = "aggregate"
+progress_window_seconds = 2.0
+max_event_text_characters = 12000
+persist_pending_requests = true
 ```
 
 `web_base_url` 若指向已运行的 DSH Web 服务，插件会直接复用；否则
 `auto_start_web = true` 时由插件启动。插件卸载时只清理由插件自己管理的进程。
+
+`interaction.enabled = true` 且 `bridge.start_event_streams = true` 时，原生 Adapter
+负责先注册 Runtime listener、再订阅 `GET /api/events.mux` 与
+`GET /api/events.host` 两条 HTTP SSE 流。每个 DSH `sessionId` 都是一个
+`platform=dsh` 的独立 Neo-MoFox 私聊流；关闭 interaction 不影响现有 CLI、RPC、Router
+或 Service 能力。
 
 ## 聊天命令
 
@@ -73,6 +89,12 @@ expose_actions = true
 /dsh stop web2
 /dsh events mux 0
 /dsh data sessions
+/dsh pending
+/dsh pending session-e8664bf4-1f7e-479e-bd6c-9a04ff87f3e1
+/dsh respond answer QUESTION_RPC_ID '[{"id":"language","selected":["Python"]}]'
+/dsh respond cancel QUESTION_RPC_ID
+/dsh respond approval APPROVAL_RPC_ID allow
+/dsh respond approval APPROVAL_RPC_ID reject
 ```
 
 命令权限为 `OWNER`。带空格或 JSON 的参数必须整体加引号，解析规则与 Neo-MoFox
@@ -85,6 +107,8 @@ expose_actions = true
 - `dsh_model_switch`：切换指定会话模型；provider 留空时按实时目录自动解析并校验推理等级。
 - `dsh_preset_switch`：切换 `blank=true` 空白会话的模式；支持 preset ID 或显示名。
 - `dsh_operate`：使用 `operation` 与 `parameters_json` 调用全部操作。
+- `dsh_respond`：只处理当前 `platform=dsh` 私聊流的 pending 请求，不能跨 session
+  回答。`answer` 传入问题答案 JSON 数组，`cancel` 取消问题，`approve`/`reject` 回答审批。
 
 例如切换到当前 DSH 原生提供的 DeepSeek-V4-Flash：
 
@@ -188,6 +212,34 @@ result = await service.switch_model(
 ```
 
 完整参数见 [API.md](API.md)。
+
+## DSH Web 会话交互
+
+普通 DSH Web 会话可在执行过程中发出 `question/requested` 和
+`approval/requested`。它们进入对应 session 的私聊流，普通文本不会被猜测为答案；只要
+该 session 有 pending 交互，普通 `session.prompt` 出站会失败，必须使用
+`dsh_respond`、Owner `/dsh respond` 命令或 Service API。
+
+问题答案是对象数组，例如：
+
+```json
+[
+  {"id": "language", "selected": ["Python"]},
+  {"id": "style", "selected": ["custom"], "custom": "保持 PEP 8"}
+]
+```
+
+审批策略由 `interaction.approval_policy` 控制：
+
+| 策略 | `dsh_respond` Bot | Owner 命令 | Service |
+| --- | --- | --- | --- |
+| `ask` | 仅可 `reject` | 可 `allow` 或 `reject` | 仅可 `reject` |
+| `autonomous` | 可 `approve` 或 `reject` | 可 `allow` 或 `reject` | 可 `allowed-once` 或 `rejected` |
+| `reject` | 新审批由 Adapter 自动 `rejected` | 仅可 `reject` | 仅可 `rejected` |
+
+每次 `allowed-once` 都精确绑定当前 `rpcId`、`approvalId` 和 session，不能复用。只有
+DSH 回执 `{"accepted": true}` 后 pending 才会消费；网络失败或其他拒绝会保留为可重试，
+`reason="not-pending"` 则标记为 stale。
 
 ## 数据与安全边界
 
