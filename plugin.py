@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BasePlugin, register_plugin
@@ -12,13 +12,16 @@ from src.app.plugin_system.base import BasePlugin, register_plugin
 from .components import (
     DshAdapterCommand,
     DshHeadlessAction,
+    DshInteractionResponseAction,
     DshModelSwitchAction,
     DshOperateAction,
     DshPresetSwitchAction,
     DshQueryTool,
     DshRpcAction,
 )
+from .adapter import DshInteractionResponder, DshTransportAdapter
 from .config import DshBridgeConfig
+from .interactions import DshInteractionRegistry
 from .operations import DshOperationDispatcher
 from .router import DshAdapterRouter
 from .runtime import DshBridgeRuntime, DshRuntimeOptions
@@ -27,13 +30,30 @@ from .service import DshAdapterService
 logger = get_logger("dsh_adapter", display="DSH Adapter")
 
 
+async def _load_without_persistence(
+    _store: str,
+    _name: str,
+) -> dict[str, Any] | None:
+    """为关闭持久化的交互 registry 返回空状态。"""
+
+    return None
+
+
+async def _save_without_persistence(
+    _store: str,
+    _name: str,
+    _data: dict[str, Any],
+) -> None:
+    """关闭 pending 持久化时丢弃保存请求。"""
+
+
 @register_plugin
 class DshAdapterPlugin(BasePlugin):
     """让 Neo-MoFox 完整调用和管理 DeepSeek Harness。"""
 
     plugin_name = "dsh_adapter"
     plugin_description = "DeepSeek Harness 全能力适配器"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     configs = [DshBridgeConfig]
 
     def __init__(self, config: DshBridgeConfig | None = None) -> None:
@@ -58,6 +78,18 @@ class DshAdapterPlugin(BasePlugin):
             )
         )
         self.dispatcher = DshOperationDispatcher(self.runtime)
+        if resolved_config.interaction.persist_pending_requests:
+            self.interaction_registry = DshInteractionRegistry()
+        else:
+            self.interaction_registry = DshInteractionRegistry(
+                load_func=_load_without_persistence,
+                save_func=_save_without_persistence,
+            )
+        self.interaction_responder = DshInteractionResponder(
+            self.runtime,
+            self.interaction_registry,
+            approval_policy=resolved_config.interaction.approval_policy,
+        )
 
     @staticmethod
     def _resolve_path(raw_path: str) -> Path:
@@ -72,6 +104,11 @@ class DshAdapterPlugin(BasePlugin):
         if not config.bridge.enabled:
             return []
         components: list[type] = [DshAdapterService, DshAdapterCommand]
+        interaction_enabled = (
+            config.interaction.enabled and config.bridge.start_event_streams
+        )
+        if interaction_enabled:
+            components.extend([DshTransportAdapter, DshInteractionResponseAction])
         if config.router.enabled:
             components.append(DshAdapterRouter)
         if config.llm.expose_tools:
@@ -89,12 +126,13 @@ class DshAdapterPlugin(BasePlugin):
         return components
 
     async def on_plugin_loaded(self) -> None:
-        """可选启动 DSH Web 并订阅两条下行事件流。"""
+        """加载 pending 状态并可选启动 DSH Web。"""
 
         config = cast(DshBridgeConfig, self.config)
         if not config.bridge.enabled:
             logger.info("DSH Adapter 已在配置中关闭")
             return
+        await self.interaction_registry.load()
         try:
             if config.bridge.auto_start_web:
                 result = await self.runtime.ensure_web(
@@ -108,7 +146,7 @@ class DshAdapterPlugin(BasePlugin):
             logger.warning(f"DSH Web 当前不可用，CLI 与数据通道仍可使用: {exc}")
             return
 
-        if config.bridge.start_event_streams:
+        if config.bridge.start_event_streams and not config.interaction.enabled:
             for stream_name in ("mux", "host"):
                 await self.runtime.start_event_stream(stream_name)
             logger.info("DSH mux 与 host 事件流订阅已启动")

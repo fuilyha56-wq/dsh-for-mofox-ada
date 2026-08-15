@@ -257,6 +257,7 @@ class DshTransportAdapter(BaseAdapter):
         *,
         runtime: DshBridgeRuntime | None = None,
         interaction_registry: DshInteractionRegistry | None = None,
+        interaction_responder: DshInteractionResponder | None = None,
         max_event_characters: int | None = None,
         progress_delivery: ProgressDeliveryMode | None = None,
         aggregation_window_seconds: float | None = None,
@@ -304,6 +305,9 @@ class DshTransportAdapter(BaseAdapter):
             raise ValueError("max_event_characters 必须大于 0")
         self.runtime = resolved_runtime
         self.interaction_registry = resolved_registry
+        self.interaction_responder = interaction_responder or getattr(
+            plugin, "interaction_responder", None
+        )
         self._max_event_characters = resolved_max_characters
         if flush_interval_seconds <= 0:
             raise ValueError("flush_interval_seconds 必须大于 0")
@@ -491,6 +495,8 @@ class DshTransportAdapter(BaseAdapter):
                 return
             if not await self.interaction_registry.upsert(interaction):
                 return
+            if interaction.kind == "approval" and self.interaction_responder is not None:
+                await self.interaction_responder.auto_reject_approval(interaction.rpc_id)
         for outbound in self._aggregator.add(rendered):
             await self.on_platform_message(outbound)
 

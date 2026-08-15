@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from plugins.dsh_adapter.adapter import DshTransportAdapter
+from plugins.dsh_adapter.adapter import DshInteractionResponder, DshTransportAdapter
 from plugins.dsh_adapter.client import DshRpcResult
 from plugins.dsh_adapter.event_messages import RenderedDshEvent
 from plugins.dsh_adapter.interactions import DshInteractionRegistry
@@ -128,6 +128,47 @@ def _make_adapter(sink: AsyncMock) -> tuple[DshTransportAdapter, DshInteractionR
         ),
         registry,
     )
+
+
+@pytest.mark.asyncio
+async def test_reject_policy_auto_rejects_new_approval_once() -> None:
+    """Adapter 仅对首次出现的 approval 请求自动发送一次 rejected。"""
+
+    sink = AsyncMock()
+    runtime = _LifecycleRuntime()
+    runtime.client.respond = AsyncMock(return_value={"accepted": True})
+    registry = DshInteractionRegistry(load_func=_load_empty, save_func=_save_memory)
+    responder = DshInteractionResponder(
+        runtime, registry, approval_policy="reject"
+    )
+    adapter = DshTransportAdapter(
+        core_sink=sink,
+        runtime=runtime,
+        interaction_registry=registry,
+        interaction_responder=responder,
+    )
+    event = _make_event(
+        rpc_id="approval-rpc",
+        payload_type="approval/requested",
+        approvalId="approval-1",
+        toolName="shell_exec",
+    )
+
+    await adapter._handle_runtime_event(event)
+    await adapter._handle_runtime_event(event)
+
+    runtime.client.respond.assert_awaited_once_with(
+        "approval-rpc",
+        {
+            "ok": True,
+            "value": {
+                "sessionId": "session-1",
+                "approvalId": "approval-1",
+                "outcome": "rejected",
+            },
+        },
+    )
+    assert await registry.list_pending("session-1") == []
 
 
 def _make_progress_event(
