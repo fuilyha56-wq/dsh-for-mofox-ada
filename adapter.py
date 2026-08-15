@@ -33,6 +33,68 @@ _logger = get_logger("dsh_adapter.adapter", display="DSH Transport Adapter")
 _EVENT_STREAMS: tuple[str, str] = ("mux", "host")
 
 
+def _extract_target_session_id(envelope: MessageEnvelope) -> str:
+    """从 DSH 私聊 outgoing envelope 取得目标 session ID。"""
+
+    message_info = envelope.get("message_info")
+    if not isinstance(message_info, dict):
+        raise ValueError("DSH 出站消息缺少 message_info")
+    if message_info.get("platform") != "dsh":
+        raise ValueError("DSH 出站消息的 platform 必须为 dsh")
+    if message_info.get("group_info") is not None:
+        raise ValueError("DSH Adapter 仅支持私聊 session 目标")
+    user_info = message_info.get("user_info")
+    if not isinstance(user_info, dict):
+        raise ValueError("DSH 出站消息缺少私聊 user_info")
+    session_id = user_info.get("user_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("DSH 出站消息缺少目标 session_id")
+    return session_id
+
+
+def _extract_text_content(envelope: MessageEnvelope) -> list[dict[str, str]]:
+    """提取 text 段并拒绝 DSH session.prompt 不支持的媒体段。"""
+
+    raw_segments = envelope.get("message_segment")
+    if isinstance(raw_segments, dict):
+        segments: list[Any] = [raw_segments]
+    elif isinstance(raw_segments, list):
+        segments = raw_segments
+    else:
+        raise ValueError("DSH 出站消息缺少 message_segment")
+    content: list[dict[str, str]] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            raise ValueError("DSH 出站消息包含无效 segment")
+        segment_type = segment.get("type")
+        if segment_type in {"reply", "at"}:
+            continue
+        if segment_type != "text":
+            raise ValueError(f"DSH session.prompt 不支持 segment: {segment_type!r}")
+        text = segment.get("data")
+        if not isinstance(text, str):
+            raise ValueError("DSH text segment 的 data 必须是字符串")
+        content.append({"type": "text", "text": text})
+    if not content:
+        raise ValueError("DSH 出站消息必须包含至少一个 text segment")
+    return content
+
+
+def _rpc_failure_message(error: dict[str, Any] | None) -> str:
+    """将 DSH RPC 业务错误转为稳定的 PlatformSendResult 错误文本。"""
+
+    details = error if isinstance(error, dict) else {}
+    code = details.get("code")
+    message = details.get("message")
+    safe_code = code if isinstance(code, str) and code else "unknown-error"
+    safe_message = (
+        message
+        if isinstance(message, str) and message
+        else "DSH session.prompt failed"
+    )
+    return f"{safe_code}: {safe_message}"
+
+
 class DshTransportAdapter(BaseAdapter):
     """把每个 DSH session 映射为一条 Neo-MoFox 私聊流。"""
 
@@ -314,12 +376,44 @@ class DshTransportAdapter(BaseAdapter):
         self,
         envelope: MessageEnvelope,
     ) -> PlatformSendResult:
-        """明确拒绝尚未实现的 DSH 普通文本出站路径。"""
+        """把空闲 DSH 私聊流的文本回复转发为 ``session.prompt``。"""
 
-        del envelope
+        try:
+            session_id = _extract_target_session_id(envelope)
+            content = _extract_text_content(envelope)
+        except ValueError as exc:
+            return PlatformSendResult(success=False, error=str(exc))
+        pending = await self.interaction_registry.list_pending(session_id)
+        if pending:
+            return PlatformSendResult(
+                success=False,
+                error=(
+                    f"DSH session {session_id!r} 存在待处理交互；"
+                    "请使用 dsh_respond 处理后再发送普通文本"
+                ),
+            )
+        try:
+            rpc_result = await self.runtime.client.call_async(
+                "session.prompt",
+                {"sessionId": session_id, "mode": "queue", "content": content},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return PlatformSendResult(
+                success=False,
+                error=f"DSH session.prompt transport failure: {exc}",
+            )
+        if rpc_result.ok:
+            return PlatformSendResult(
+                success=True,
+                message_id=rpc_result.rpc_id,
+                response=rpc_result.to_dict(),
+            )
         return PlatformSendResult(
             success=False,
-            error="DSH Transport Adapter 的普通文本出站将在 Task 6 实现",
+            error=_rpc_failure_message(rpc_result.error),
+            response=rpc_result.to_dict(),
         )
 
     async def get_bot_info(self) -> dict[str, Any]:

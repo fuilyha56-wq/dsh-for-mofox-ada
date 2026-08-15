@@ -147,6 +147,31 @@ def _make_progress_event(
     )
 
 
+def _make_outgoing_envelope(
+    *,
+    session_id: str = "session-1",
+    platform: str = "dsh",
+    segments: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """构造发往一个 DSH 私聊 session 的标准 outgoing envelope。"""
+
+    return {
+        "direction": "outgoing",
+        "message_info": {
+            "platform": platform,
+            "message_id": "outgoing-1",
+            "user_info": {
+                "platform": platform,
+                "user_id": session_id,
+                "role": None,
+            },
+        },
+        "message_segment": segments
+        if segments is not None
+        else [{"type": "text", "data": "继续执行并汇报结果"}],
+    }
+
+
 @pytest.mark.asyncio
 async def test_question_event_enters_core_as_dsh_private_message() -> None:
     """question/requested 应沿标准 Adapter/CoreSink 链进入 DSH 私聊流。"""
@@ -540,3 +565,180 @@ async def test_regular_outgoing_message_reports_explicit_failure() -> None:
 
     assert result.success is False
     assert result.error is not None
+
+
+@pytest.mark.asyncio
+async def test_outgoing_text_prompts_idle_dsh_session() -> None:
+    """空闲 DSH 私聊流的文本回复应转成 session.prompt。"""
+
+    sink = AsyncMock()
+    runtime = _LifecycleRuntime()
+    registry = DshInteractionRegistry(load_func=_load_empty, save_func=_save_memory)
+    adapter = DshTransportAdapter(
+        core_sink=sink,
+        runtime=runtime,
+        interaction_registry=registry,
+    )
+    runtime.client.call_async.return_value = DshRpcResult(
+        rpc_id="prompt-rpc",
+        ok=True,
+        value={"queued": True},
+    )
+
+    result = await adapter._send_platform_message(_make_outgoing_envelope())
+
+    assert result.success is True
+    runtime.client.call_async.assert_awaited_once_with(
+        "session.prompt",
+        {
+            "sessionId": "session-1",
+            "mode": "queue",
+            "content": [{"type": "text", "text": "继续执行并汇报结果"}],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_outgoing_text_is_blocked_when_session_has_pending_interaction() -> None:
+    """存在 pending question 时，普通文本不得绕过 dsh_respond。"""
+
+    sink = AsyncMock()
+    runtime = _LifecycleRuntime()
+    registry = DshInteractionRegistry(load_func=_load_empty, save_func=_save_memory)
+    adapter = DshTransportAdapter(
+        core_sink=sink,
+        runtime=runtime,
+        interaction_registry=registry,
+    )
+    await adapter._handle_runtime_event(
+        _make_event(
+            rpc_id="question-rpc",
+            payload_type="question/requested",
+            questions=[],
+        )
+    )
+    runtime.client.call_async.reset_mock()
+
+    result = await adapter._send_platform_message(_make_outgoing_envelope())
+
+    assert result.success is False
+    assert "dsh_respond" in (result.error or "")
+    runtime.client.call_async.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("envelope", "expected_error"),
+    [
+        (_make_outgoing_envelope(platform="qq"), "platform 必须为 dsh"),
+        (
+            {
+                "direction": "outgoing",
+                "message_info": {"platform": "dsh", "message_id": "outgoing-1"},
+                "message_segment": [{"type": "text", "data": "hello"}],
+            },
+            "缺少私聊 user_info",
+        ),
+        (
+            _make_outgoing_envelope(segments=[{"type": "image", "data": "base64"}]),
+            "不支持 segment",
+        ),
+        (
+            _make_outgoing_envelope(segments=[{"type": "reply", "data": "old"}]),
+            "至少一个 text segment",
+        ),
+    ],
+)
+async def test_outgoing_text_rejects_invalid_target_or_segments(
+    envelope: dict[str, Any],
+    expected_error: str,
+) -> None:
+    """非 DSH 私聊、缺目标和媒体/空文本段必须在调用 RPC 前拒绝。"""
+
+    sink = AsyncMock()
+    runtime = _LifecycleRuntime()
+    registry = DshInteractionRegistry(load_func=_load_empty, save_func=_save_memory)
+    adapter = DshTransportAdapter(
+        core_sink=sink,
+        runtime=runtime,
+        interaction_registry=registry,
+    )
+
+    result = await adapter._send_platform_message(envelope)
+
+    assert result.success is False
+    assert expected_error in (result.error or "")
+    runtime.client.call_async.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_outgoing_text_maps_dsh_business_failure_to_send_result() -> None:
+    """DSH RPC 业务错误必须保留回执并使用稳定的 code/message 错误文本。"""
+
+    sink = AsyncMock()
+    runtime = _LifecycleRuntime()
+    registry = DshInteractionRegistry(load_func=_load_empty, save_func=_save_memory)
+    adapter = DshTransportAdapter(
+        core_sink=sink,
+        runtime=runtime,
+        interaction_registry=registry,
+    )
+    runtime.client.call_async.return_value = DshRpcResult(
+        rpc_id="prompt-rpc",
+        ok=False,
+        error={"code": "session-busy", "message": "waiting for tool"},
+    )
+
+    result = await adapter._send_platform_message(_make_outgoing_envelope())
+
+    assert result.success is False
+    assert result.error == "session-busy: waiting for tool"
+    assert result.response == {
+        "rpc_id": "prompt-rpc",
+        "ok": False,
+        "error": {"code": "session-busy", "message": "waiting for tool"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_outgoing_text_uses_stable_defaults_for_incomplete_dsh_error() -> None:
+    """DSH 省略 code/message 时应使用约定的稳定错误默认值。"""
+
+    sink = AsyncMock()
+    runtime = _LifecycleRuntime()
+    registry = DshInteractionRegistry(load_func=_load_empty, save_func=_save_memory)
+    adapter = DshTransportAdapter(
+        core_sink=sink,
+        runtime=runtime,
+        interaction_registry=registry,
+    )
+    runtime.client.call_async.return_value = DshRpcResult(
+        rpc_id="prompt-rpc",
+        ok=False,
+        error={},
+    )
+
+    result = await adapter._send_platform_message(_make_outgoing_envelope())
+
+    assert result.success is False
+    assert result.error == "unknown-error: DSH session.prompt failed"
+
+
+@pytest.mark.asyncio
+async def test_outgoing_text_maps_transport_exception_to_failure() -> None:
+    """session.prompt 传输异常必须被转成明确失败，不得向核心抛出。"""
+
+    sink = AsyncMock()
+    runtime = _LifecycleRuntime()
+    registry = DshInteractionRegistry(load_func=_load_empty, save_func=_save_memory)
+    adapter = DshTransportAdapter(
+        core_sink=sink,
+        runtime=runtime,
+        interaction_registry=registry,
+    )
+    runtime.client.call_async.side_effect = RuntimeError("network down")
+
+    result = await adapter._send_platform_message(_make_outgoing_envelope())
+
+    assert result.success is False
+    assert "transport failure: network down" in (result.error or "")
