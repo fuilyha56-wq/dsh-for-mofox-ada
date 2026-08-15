@@ -67,7 +67,7 @@ def test_manifest_registers_adapter_and_response_action() -> None:
     assert len(manifest["include"]) == 12
     assert ("adapter", "dsh_adapter") in includes
     assert ("action", "dsh_respond") in includes
-    assert all("websockets" not in item for item in manifest["python_dependencies"])
+    assert "websockets>=15.0.1,<17" in manifest["python_dependencies"]
 
 
 def test_dsh_bundle_metadata_registers_the_package_patch() -> None:
