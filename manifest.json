@@ -1,7 +1,7 @@
 {
   "name": "dsh_adapter",
   "display_name": "DSH Adapter",
-  "version": "1.3.0",
+  "version": "1.0.0",
   "description": "让 Neo-MoFox 完整调用和管理 DeepSeek Harness",
   "author": "MoFox User",
   "dependencies": {
@@ -22,6 +22,12 @@
       "enabled": true
     },
     {
+      "component_type": "adapter",
+      "component_name": "dsh_adapter",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
       "component_type": "router",
       "component_name": "dsh_adapter",
       "dependencies": [],
@@ -30,6 +36,12 @@
     {
       "component_type": "tool",
       "component_name": "dsh_query",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "action",
+      "component_name": "dsh_respond",
       "dependencies": [],
       "enabled": true
     },
@@ -77,8 +89,7 @@
   },
   "min_core_version": "1.3.0-alpha.0",
   "python_dependencies": [
-    "httpx>=0.28.1,<1",
-    "websockets>=16,<17"
+    "httpx>=0.28.1,<1"
   ],
   "dependencies_required": true,
   "categories": [

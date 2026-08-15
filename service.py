@@ -6,6 +6,8 @@ from typing import Any, Protocol, cast
 
 from src.app.plugin_system.base import BaseService
 
+from .adapter import DshInteractionResponder
+from .interactions import DshInteractionRegistry, DshPendingInteraction
 from .operations import DshOperationDispatcher
 
 
@@ -13,6 +15,20 @@ class _DshAdapterPluginProtocol(Protocol):
     """公共服务依赖的最小插件接口。"""
 
     dispatcher: DshOperationDispatcher
+    interaction_registry: DshInteractionRegistry
+    interaction_responder: DshInteractionResponder
+
+
+def _interaction_audit_record(interaction: DshPendingInteraction) -> dict[str, Any]:
+    """返回不含原始题面或凭据的 pending 交互审计字段。"""
+
+    return {
+        "rpc_id": interaction.rpc_id,
+        "session_id": interaction.session_id,
+        "kind": interaction.kind,
+        "state": interaction.state,
+        "approval_id": interaction.approval_id,
+    }
 
 
 class DshAdapterService(BaseService):
@@ -20,13 +36,58 @@ class DshAdapterService(BaseService):
 
     name = "dsh_adapter"
     description = "调用 DSH 模型、RPC、HTTP、CLI、进程、事件流和数据能力"
-    version = "1.3.0"
+    version = "1.0.0"
 
     @property
     def dispatcher(self) -> DshOperationDispatcher:
         """返回插件共享的操作分派器。"""
 
         return cast(_DshAdapterPluginProtocol, self.plugin).dispatcher
+
+    @property
+    def interaction_registry(self) -> DshInteractionRegistry:
+        """返回插件共享的 pending interaction registry。"""
+
+        return cast(_DshAdapterPluginProtocol, self.plugin).interaction_registry
+
+    @property
+    def interaction_responder(self) -> DshInteractionResponder:
+        """返回插件共享的结构化 interaction responder。"""
+
+        return cast(_DshAdapterPluginProtocol, self.plugin).interaction_responder
+
+    async def list_pending(
+        self, session_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """列出 pending 交互的无题面审计记录。"""
+
+        records = await self.interaction_registry.list_pending(session_id)
+        return [_interaction_audit_record(record) for record in records]
+
+    async def answer_question(
+        self,
+        rpc_id: str,
+        answers: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """以 Service 身份提交一条 question 的结构化答案。"""
+
+        return await self.interaction_responder.respond_question(rpc_id, answers)
+
+    async def cancel_question(self, rpc_id: str) -> dict[str, Any]:
+        """以 Service 身份取消一条 pending question。"""
+
+        return await self.interaction_responder.cancel_question(rpc_id)
+
+    async def respond_approval(
+        self,
+        rpc_id: str,
+        outcome: str,
+    ) -> dict[str, Any]:
+        """以固定 Service 身份回应一条 pending approval。"""
+
+        return await self.interaction_responder.respond_approval(
+            rpc_id, outcome, actor="service"
+        )
 
     async def execute(
         self,

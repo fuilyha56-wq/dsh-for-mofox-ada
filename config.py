@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from src.app.plugin_system.base import BaseConfig, Field, SectionBase, config_section
 
@@ -98,6 +98,35 @@ class DshBridgeConfig(BaseConfig):
             description="Tool、Action 与 Command 返回文本最大字符数",
         )
 
+    @config_section("interaction")
+    class InteractionSection(SectionBase):
+        """DSH Web session 的结构化交互与事件投递策略。"""
+
+        enabled: bool = Field(default=True, description="是否启用原生 DSH Transport Adapter")
+        approval_policy: Literal["ask", "autonomous", "reject"] = Field(
+            default="ask",
+            description="审批策略：ask、autonomous 或 reject",
+        )
+        progress_delivery: Literal["aggregate", "immediate"] = Field(
+            default="aggregate",
+            description="普通 session 进度事件的投递方式",
+        )
+        progress_window_seconds: float = Field(
+            default=2.0,
+            gt=0,
+            description="aggregate 模式下的进度聚合窗口秒数",
+        )
+        max_event_text_characters: int = Field(
+            default=12000,
+            gt=0,
+            description="单条渲染 DSH 事件的最大文本字符数",
+        )
+        persist_pending_requests: bool = Field(
+            default=True,
+            description="是否持久化 pending question 与 approval 请求",
+        )
+
     bridge: BridgeSection = Field(default_factory=BridgeSection)
     router: RouterSection = Field(default_factory=RouterSection)
     llm: LlmSection = Field(default_factory=LlmSection)
+    interaction: InteractionSection = Field(default_factory=InteractionSection)
