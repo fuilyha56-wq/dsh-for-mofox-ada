@@ -8,6 +8,8 @@ from typing import Any
 import pytest
 
 from plugins.dsh_adapter.components import (
+    DshAdapterCommand,
+    DshInteractionResponseAction,
     DshModelSwitchAction,
     DshOperateAction,
     DshPresetSwitchAction,
@@ -15,6 +17,7 @@ from plugins.dsh_adapter.components import (
     DshRpcAction,
 )
 from plugins.dsh_adapter.config import DshBridgeConfig
+from plugins.dsh_adapter.interactions import DshPendingInteraction
 
 
 class RecordingDispatcher:
@@ -46,6 +49,88 @@ class FakePlugin:
 
         self.config = DshBridgeConfig()
         self.dispatcher = RecordingDispatcher()
+
+
+class RecordingResponder:
+    """记录结构化交互 responder 调用。"""
+
+    def __init__(self) -> None:
+        """初始化调用记录。"""
+
+        self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+    async def respond_question(
+        self, rpc_id: str, answers: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """记录问题回答。"""
+
+        self.calls.append(("question", (rpc_id, answers), {}))
+        return {"accepted": True, "rpc_id": rpc_id}
+
+    async def cancel_question(self, rpc_id: str) -> dict[str, Any]:
+        """记录问题取消。"""
+
+        self.calls.append(("cancel", (rpc_id,), {}))
+        return {"accepted": True, "rpc_id": rpc_id}
+
+    async def respond_approval(
+        self, rpc_id: str, outcome: str, *, actor: str
+    ) -> dict[str, Any]:
+        """记录审批响应及固定 actor。"""
+
+        self.calls.append(("approval", (rpc_id, outcome), {"actor": actor}))
+        return {"accepted": True, "rpc_id": rpc_id}
+
+
+class RecordingRegistry:
+    """按 rpc ID 返回测试 pending 交互。"""
+
+    def __init__(self, interactions: dict[str, DshPendingInteraction]) -> None:
+        """保存测试 pending 交互。"""
+
+        self.interactions = interactions
+
+    async def get_pending(self, rpc_id: str) -> DshPendingInteraction:
+        """取得指定 pending 交互。"""
+
+        return self.interactions[rpc_id]
+
+
+class DshInteractionPlugin(FakePlugin):
+    """为 dsh_respond 提供 responder 与 registry 的测试插件。"""
+
+    def __init__(self, interactions: dict[str, DshPendingInteraction]) -> None:
+        """初始化交互相关测试依赖。"""
+
+        super().__init__()
+        self.interaction_registry = RecordingRegistry(interactions)
+        self.interaction_responder = RecordingResponder()
+
+
+class DshChatStream:
+    """模拟带最新 DSH 入站消息的 ChatStream。"""
+
+    def __init__(self, session_id: str) -> None:
+        """构造 private dsh 流。"""
+
+        self.platform = "dsh"
+        self.context = type(
+            "Context", (), {"current_message": type("Message", (), {"sender_id": session_id})()}
+        )()
+
+
+def _pending_question(rpc_id: str, session_id: str) -> DshPendingInteraction:
+    """构造 Action 测试使用的 pending question。"""
+
+    return DshPendingInteraction(
+        rpc_id=rpc_id,
+        session_id=session_id,
+        kind="question",
+        payload={"type": "question/requested", "sessionId": session_id, "questions": []},
+        stream="mux",
+        first_seen_at="2026-08-15T00:00:00+00:00",
+        last_seen_at="2026-08-15T00:00:00+00:00",
+    )
 
 
 @pytest.mark.asyncio
@@ -154,3 +239,84 @@ async def test_rpc_action_preserves_any_method_and_payload() -> None:
         )
     ]
     assert "future.domainAction" in rendered
+
+
+@pytest.mark.asyncio
+async def test_dsh_respond_action_cannot_cross_dsh_sessions() -> None:
+    """Action 只能回应当前 DSH 私聊流所属 session 的 pending rpcId。"""
+
+    plugin = DshInteractionPlugin(
+        {
+            "rpc-1": _pending_question("rpc-1", "session-1"),
+            "rpc-2": _pending_question("rpc-2", "session-2"),
+        }
+    )
+    action = DshInteractionResponseAction(DshChatStream("session-1"), plugin)  # type: ignore[arg-type]
+
+    success, _ = await action.execute(
+        "rpc-1", "answer", '[{"id":"language","selected":["Python"]}]'
+    )
+    cross_success, cross_result = await action.execute("rpc-2", "cancel")
+
+    assert success is True
+    assert cross_success is False
+    assert "当前 DSH session" in cross_result
+    assert plugin.interaction_responder.calls == [
+        ("question", ("rpc-1", [{"id": "language", "selected": ["Python"]}]), {})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dsh_respond_action_uses_bot_actor_for_approval() -> None:
+    """LLM Action 的审批调用者必须固定为 bot。"""
+
+    interaction = DshPendingInteraction(
+        rpc_id="approval-rpc",
+        session_id="session-1",
+        kind="approval",
+        payload={
+            "type": "approval/requested",
+            "sessionId": "session-1",
+            "approvalId": "approval-1",
+        },
+        stream="mux",
+        first_seen_at="2026-08-15T00:00:00+00:00",
+        last_seen_at="2026-08-15T00:00:00+00:00",
+        approval_id="approval-1",
+    )
+    plugin = DshInteractionPlugin({"approval-rpc": interaction})
+    action = DshInteractionResponseAction(DshChatStream("session-1"), plugin)  # type: ignore[arg-type]
+
+    success, _ = await action.execute("approval-rpc", "approve")
+
+    assert success is True
+    assert plugin.interaction_responder.calls == [
+        ("approval", ("approval-rpc", "allowed-once"), {"actor": "bot"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_owner_command_uses_owner_actor_for_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owner 命令的 allow 映射必须固定使用 owner，而不能伪装成 bot。"""
+
+    sent: list[str] = []
+
+    async def _send_text(text: str, **_kwargs: Any) -> bool:
+        """记录命令回包。"""
+
+        sent.append(text)
+        return True
+
+    monkeypatch.setattr("plugins.dsh_adapter.components.send_text", _send_text)
+    plugin = DshInteractionPlugin({})
+    command = DshAdapterCommand(plugin, "owner-stream")  # type: ignore[arg-type]
+
+    success, _ = await command.handle_respond_approval("approval-rpc", "allow")
+
+    assert success is True
+    assert plugin.interaction_responder.calls == [
+        ("approval", ("approval-rpc", "allowed-once"), {"actor": "owner"})
+    ]
+    assert len(sent) == 1

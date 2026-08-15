@@ -9,7 +9,9 @@ from src.app.plugin_system.api.send_api import send_text
 from src.app.plugin_system.base import BaseAction, BaseCommand, BaseTool, cmd_route
 from src.app.plugin_system.types import PermissionLevel
 
+from .adapter import DshInteractionResponder
 from .config import DshBridgeConfig
+from .interactions import DshInteractionRegistry, DshPendingInteraction
 from .operations import DshOperationDispatcher, READ_ONLY_OPERATIONS, SUPPORTED_OPERATIONS
 
 _USAGE = """/dsh 用法：
@@ -29,6 +31,10 @@ _USAGE = """/dsh 用法：
   /dsh stop <process_id>
   /dsh events <mux|host> [after_sequence]
   /dsh data <相对DSH_HOME路径>
+    /dsh pending [session_id]
+    /dsh respond answer <rpc_id> '<answers JSON array>'
+    /dsh respond cancel <rpc_id>
+    /dsh respond approval <rpc_id> <allow|reject>
   /dsh help
 
 完整操作：""" + ", ".join(SUPPORTED_OPERATIONS)
@@ -39,6 +45,8 @@ class _DshAdapterPluginProtocol(Protocol):
 
     config: DshBridgeConfig
     dispatcher: DshOperationDispatcher
+    interaction_registry: DshInteractionRegistry
+    interaction_responder: DshInteractionResponder
 
 
 def _plugin(component: BaseTool | BaseAction | BaseCommand) -> _DshAdapterPluginProtocol:
@@ -71,6 +79,18 @@ def _parse_string_list(raw: str, name: str) -> list[str]:
     return value
 
 
+def _parse_object_list(raw: str, name: str) -> list[dict[str, Any]]:
+    """解析 JSON 对象数组参数。"""
+
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} 不是有效 JSON: {exc}") from exc
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError(f"{name} 必须是 JSON 对象数组")
+    return value
+
+
 def _render(value: dict[str, Any], limit: int) -> str:
     """将结构化结果渲染为有长度上限的 JSON。"""
 
@@ -78,6 +98,97 @@ def _render(value: dict[str, Any], limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n... [已截断 {len(text) - limit} 个字符]"
+
+
+def _interaction_audit_record(interaction: DshPendingInteraction) -> dict[str, Any]:
+    """将 pending 交互转换为不含题面或凭据的审计记录。"""
+
+    return {
+        "rpc_id": interaction.rpc_id,
+        "session_id": interaction.session_id,
+        "kind": interaction.kind,
+        "state": interaction.state,
+        "approval_id": interaction.approval_id,
+    }
+
+
+class DshInteractionResponseAction(BaseAction):
+    """让 LLM 在当前 DSH 私聊流中处理一条 pending 交互。"""
+
+    name = "dsh_respond"
+    description = (
+        "回答当前 DeepSeek Harness 私聊流中的 pending 问题或审批。"
+        "response_type 只能是 answer、cancel、approve、reject；"
+        "不得使用此 Action 回答其他 DSH session 的请求。"
+    )
+    primary_action = False
+    associated_platforms = ["dsh"]
+    associated_types = ["text"]
+
+    async def execute(
+        self,
+        rpc_id: str,
+        response_type: str,
+        response_json: str = "{}",
+    ) -> tuple[bool, str]:
+        """在当前 DSH session 中发送结构化交互响应。
+
+        Args:
+            rpc_id: 当前 DSH session 中 pending 请求的 RPC ID。
+            response_type: answer、cancel、approve 或 reject。
+            response_json: answer 时所需的 JSON 对象数组，其余类型可省略。
+        """
+
+        plugin = _plugin(self)
+        try:
+            interaction = await plugin.interaction_registry.get_pending(rpc_id)
+            session_id = self._current_session_id()
+            if interaction.session_id != session_id:
+                return False, "该 pending 请求不属于当前 DSH session"
+            result = await self._respond(
+                plugin.interaction_responder,
+                rpc_id,
+                response_type,
+                response_json,
+            )
+        except Exception as exc:
+            return False, f"DSH 交互响应失败: {exc}"
+        return True, _render(result, plugin.config.llm.max_result_characters)
+
+    def _current_session_id(self) -> str:
+        """从当前 DSH ChatStream 的最新入站消息取得可信 session ID。"""
+
+        if getattr(self.chat_stream, "platform", "") != "dsh":
+            raise ValueError("dsh_respond 只能在 DSH 私聊流中调用")
+        context = getattr(self.chat_stream, "context", None)
+        message = getattr(context, "current_message", None)
+        session_id = getattr(message, "sender_id", None)
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("当前 DSH 流缺少可信 session_id")
+        return session_id
+
+    @staticmethod
+    async def _respond(
+        responder: DshInteractionResponder,
+        rpc_id: str,
+        response_type: str,
+        response_json: str,
+    ) -> dict[str, Any]:
+        """按固定 bot 身份分派一条已完成同流校验的响应。"""
+
+        if response_type == "answer":
+            return await responder.respond_question(
+                rpc_id, _parse_object_list(response_json, "response_json")
+            )
+        if response_type == "cancel":
+            return await responder.cancel_question(rpc_id)
+        if response_type == "approve":
+            return await responder.respond_approval(
+                rpc_id, "allowed-once", actor="bot"
+            )
+        if response_type == "reject":
+            return await responder.respond_approval(rpc_id, "rejected", actor="bot")
+        raise ValueError(f"不支持的 response_type: {response_type!r}")
 
 
 class DshQueryTool(BaseTool):
@@ -597,5 +708,65 @@ class DshAdapterCommand(BaseCommand):
             return await self._reply_result(
                 await _plugin(self).dispatcher.execute("data_list", {"path": path})
             )
+        except Exception as exc:
+            return await self._reply_error(exc)
+
+    @cmd_route("pending")
+    async def handle_pending(self, session_id: str = "") -> tuple[bool, str]:
+        """列出全部或指定 session 的 pending DSH 交互。"""
+
+        plugin = _plugin(self)
+        try:
+            records = await plugin.interaction_registry.list_pending(session_id or None)
+            result = {"pending": [_interaction_audit_record(record) for record in records]}
+            return await self._reply_result(result)
+        except Exception as exc:
+            return await self._reply_error(exc)
+
+    @cmd_route("respond", "answer")
+    async def handle_respond_answer(
+        self,
+        rpc_id: str,
+        answers_json: str,
+    ) -> tuple[bool, str]:
+        """以 Owner 身份回答一条 pending question。"""
+
+        try:
+            result = await _plugin(self).interaction_responder.respond_question(
+                rpc_id, _parse_object_list(answers_json, "answers_json")
+            )
+            return await self._reply_result(result)
+        except Exception as exc:
+            return await self._reply_error(exc)
+
+    @cmd_route("respond", "cancel")
+    async def handle_respond_cancel(self, rpc_id: str) -> tuple[bool, str]:
+        """以 Owner 身份取消一条 pending question。"""
+
+        try:
+            result = await _plugin(self).interaction_responder.cancel_question(rpc_id)
+            return await self._reply_result(result)
+        except Exception as exc:
+            return await self._reply_error(exc)
+
+    @cmd_route("respond", "approval")
+    async def handle_respond_approval(
+        self,
+        rpc_id: str,
+        decision: str,
+    ) -> tuple[bool, str]:
+        """以 Owner 身份允许一次或拒绝一条 pending approval。"""
+
+        outcome_by_decision = {"allow": "allowed-once", "reject": "rejected"}
+        outcome = outcome_by_decision.get(decision)
+        if outcome is None:
+            return await self._reply_error(
+                ValueError("approval 决策只能是 allow 或 reject")
+            )
+        try:
+            result = await _plugin(self).interaction_responder.respond_approval(
+                rpc_id, outcome, actor="owner"
+            )
+            return await self._reply_result(result)
         except Exception as exc:
             return await self._reply_error(exc)
