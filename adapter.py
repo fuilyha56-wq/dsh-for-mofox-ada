@@ -7,7 +7,7 @@ import copy
 from datetime import datetime
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from mofox_wire import CoreSink, MessageEnvelope
 from mofox_wire.types import UserRole
@@ -23,6 +23,11 @@ from .event_messages import (
     RenderedDshEvent,
     render_dsh_event,
 )
+from .interaction_codec import (
+    build_approval_response,
+    build_question_cancellation,
+    build_question_response,
+)
 from .interactions import DshInteractionRegistry, DshPendingInteraction
 from .runtime import DshBridgeRuntime, DshRuntimeEvent
 
@@ -31,6 +36,8 @@ if TYPE_CHECKING:
 
 _logger = get_logger("dsh_adapter.adapter", display="DSH Transport Adapter")
 _EVENT_STREAMS: tuple[str, str] = ("mux", "host")
+ApprovalPolicy = Literal["ask", "autonomous", "reject"]
+InteractionActor = Literal["bot", "owner", "service"]
 
 
 def _extract_target_session_id(envelope: MessageEnvelope) -> str:
@@ -93,6 +100,145 @@ def _rpc_failure_message(error: dict[str, Any] | None) -> str:
         else "DSH session.prompt failed"
     )
     return f"{safe_code}: {safe_message}"
+
+
+class DshInteractionResponder:
+    """以 registry 事务方式向 DSH 回答问题或审批请求。"""
+
+    def __init__(
+        self,
+        runtime: DshBridgeRuntime,
+        registry: DshInteractionRegistry,
+        *,
+        approval_policy: ApprovalPolicy = "ask",
+    ) -> None:
+        """初始化共享 Runtime、pending registry 和审批权限策略。"""
+
+        if approval_policy not in {"ask", "autonomous", "reject"}:
+            raise ValueError(f"未知 approval_policy: {approval_policy!r}")
+        self._runtime = runtime
+        self._registry = registry
+        self._approval_policy = approval_policy
+
+    async def respond_question(
+        self,
+        rpc_id: str,
+        answers: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """提交结构化问题答案，并仅在 DSH 接受后结束 pending。"""
+
+        return await self._respond(
+            rpc_id,
+            expected_kind="question",
+            build_result=lambda interaction: build_question_response(
+                interaction, answers
+            ),
+        )
+
+    async def cancel_question(self, rpc_id: str) -> dict[str, Any]:
+        """取消 pending question，保留畸形题面的协议逃生通道。"""
+
+        return await self._respond(
+            rpc_id,
+            expected_kind="question",
+            build_result=build_question_cancellation,
+        )
+
+    async def respond_approval(
+        self,
+        rpc_id: str,
+        outcome: str,
+        *,
+        actor: InteractionActor,
+    ) -> dict[str, Any]:
+        """按审批策略和调用方身份提交单次审批结果。"""
+
+        self._check_approval_permission(outcome, actor)
+        return await self._respond(
+            rpc_id,
+            expected_kind="approval",
+            build_result=lambda interaction: build_approval_response(interaction, outcome),
+        )
+
+    async def auto_reject_approval(self, rpc_id: str) -> dict[str, Any] | None:
+        """在 reject 策略下自动拒绝首次出现的 pending approval。"""
+
+        if self._approval_policy != "reject":
+            return None
+        try:
+            return await self.respond_approval(rpc_id, "rejected", actor="bot")
+        except KeyError:
+            return None
+
+    def _check_approval_permission(
+        self,
+        outcome: str,
+        actor: InteractionActor,
+    ) -> None:
+        """拒绝不符合当前审批策略或未知调用方的 allowed-once 请求。"""
+
+        if actor not in {"bot", "owner", "service"}:
+            raise ValueError(f"未知审批 actor: {actor!r}")
+        if outcome != "allowed-once":
+            return
+        if self._approval_policy == "autonomous":
+            return
+        if self._approval_policy == "ask" and actor == "owner":
+            return
+        raise PermissionError(
+            f"approval_policy={self._approval_policy!r} 不允许 actor={actor!r} "
+            "提交 allowed-once"
+        )
+
+    async def _respond(
+        self,
+        rpc_id: str,
+        *,
+        expected_kind: Literal["question", "approval"],
+        build_result: Callable[[DshPendingInteraction], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """执行 pending -> responding -> accepted terminal state 的响应事务。"""
+
+        interaction = await self._registry.get_pending(rpc_id)
+        if interaction.kind != expected_kind:
+            raise ValueError(
+                f"交互 {rpc_id!r} 的 kind 为 {interaction.kind!r}，"
+                f"不能按 {expected_kind!r} 响应"
+            )
+        result = build_result(interaction)
+        await self._registry.mark_responding(rpc_id)
+        try:
+            receipt = await self._runtime.client.respond(rpc_id, result)
+        except BaseException:
+            await self._registry.mark_pending(rpc_id)
+            raise
+        if not isinstance(receipt, dict) or receipt.get("accepted") is not True:
+            reason = receipt.get("reason") if isinstance(receipt, dict) else None
+            if reason == "not-pending":
+                await self._registry.mark_stale(rpc_id)
+                return self._result_record(interaction, False, "stale", receipt)
+            await self._registry.mark_pending(rpc_id)
+            raise ValueError(f"DSH 未接受交互响应: {receipt!r}")
+        await self._registry.mark_resolved(rpc_id)
+        return self._result_record(interaction, True, "resolved", receipt)
+
+    @staticmethod
+    def _result_record(
+        interaction: DshPendingInteraction,
+        accepted: bool,
+        state: str,
+        receipt: dict[str, Any],
+    ) -> dict[str, Any]:
+        """返回不含题面或凭据的结构化响应审计结果。"""
+
+        return {
+            "rpc_id": interaction.rpc_id,
+            "session_id": interaction.session_id,
+            "kind": interaction.kind,
+            "accepted": accepted,
+            "state": state,
+            "receipt": receipt,
+        }
 
 
 class DshTransportAdapter(BaseAdapter):
